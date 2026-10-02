@@ -37,9 +37,9 @@ When a user interacts with a sandbox by providing an external API key (e.g., for
 ```mermaid
 flowchart LR
     cl["client<br/>MCP router / SDK (api-key)"]:::store
-    cr[("sandbox CR<br/>(k8s etcd)")]:::store
 
     subgraph DP [Data Plane]
+        cr[("sandbox CR<br/>(k8s etcd)")]:::store
         gw["sandbox-ingress-gateway<br/>Envoy chain + forward proxy"]:::dp
         az["auth-service ext_authz<br/>authz + liveness (250ms budget)"]:::dp
         act["sandbox-activator<br/>hold · single-flight · forward"]:::star

@@ -30,19 +30,26 @@ When a user interacts with a sandbox by providing an external API key (e.g., for
    - **If `agent-id` is present:** It calls the `ResumeAgent` API.
    - **If `agent-id` is missing:** It calls the standard `ResumeSandbox` API.
    The CP service evaluates API key scopes, validates funds, and processes snapshot and restore annotations to unpause the agent.
+7. **Holding & Proxying:** The activator holds the original request until the agent transitions to `Ready`. Once ready, it proxies the connection back to the **sandbox-ingress-gateway**.
 8. **Re-Authorization & Final Routing:** The gateway receives the proxied request and once again makes an `ext_authz` call to the **auth-service**. Because the agent is now running, the auth-service allows the request and routes the traffic to `sandboxd` (port 44772) on the resumed agent.
 9. **Response:** The response is finally returned to the client.
 
 ```mermaid
 flowchart LR
     cl["client<br/>MCP router / SDK (api-key)"]:::store
-    gw["sandbox-ingress-gateway<br/>Envoy chain + forward proxy"]:::dp
-    az["auth-service ext_authz<br/>authz + liveness (250ms budget)"]:::dp
-    act["sandbox-activator<br/>hold · single-flight · forward"]:::star
     cr[("sandbox CR<br/>(k8s etcd)")]:::store
-    igw["Istio internal gateway<br/>TLS 443 · internal CA"]:::dp
-    cp["aiagent-service<br/>ResumeAgent OR ResumeSandbox<br/>api-key scope · funds · snapshot + restore annotations"]:::cp
-    sd["sandboxd :44772"]:::dp
+
+    subgraph DP [Data Plane]
+        gw["sandbox-ingress-gateway<br/>Envoy chain + forward proxy"]:::dp
+        az["auth-service ext_authz<br/>authz + liveness (250ms budget)"]:::dp
+        act["sandbox-activator<br/>hold · single-flight · forward"]:::star
+        igw["Istio internal gateway<br/>TLS 443 · internal CA"]:::dp
+        sd["sandboxd :44772"]:::dp
+    end
+
+    subgraph CP [Control Plane]
+        cp["aiagent-service<br/>ResumeAgent OR ResumeSandbox<br/>api-key scope · funds · snapshot + restore annotations"]:::cp
+    end
 
     cl -->|"1 request to sb-abc"| gw
     gw -->|"2 authorize"| az
@@ -101,12 +108,18 @@ The `auth-service` acts as a token-exchange layer, minting a secure internal JWT
 ```mermaid
 flowchart LR
     cl["browser<br/>Web UI Session (cookie)"]:::store
-    gw["sandbox-ingress-gateway<br/>Envoy chain + forward proxy"]:::dp
-    az["auth-service ext_authz<br/>validate cookie + mint internal JWT"]:::dp
-    act["sandbox-activator<br/>hold · single-flight · proxy"]:::star
-    igw["Istio internal gateway<br/>TLS 443 · internal CA"]:::dp
-    cp["aiagent-service ResumeAgent<br/>validates JWT · user-id scope"]:::cp
-    sd["sandboxd :44772"]:::dp
+
+    subgraph DP [Data Plane]
+        gw["sandbox-ingress-gateway<br/>Envoy chain + forward proxy"]:::dp
+        az["auth-service ext_authz<br/>validate cookie + mint internal JWT"]:::dp
+        act["sandbox-activator<br/>hold · single-flight · proxy"]:::star
+        igw["Istio internal gateway<br/>TLS 443 · internal CA"]:::dp
+        sd["sandboxd :44772"]:::dp
+    end
+
+    subgraph CP [Control Plane]
+        cp["aiagent-service ResumeAgent<br/>validates JWT · user-id scope"]:::cp
+    end
 
     cl -->|"1 GET / (cookie)"| gw
     gw -->|"2 authorize"| az

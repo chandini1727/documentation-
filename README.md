@@ -1,38 +1,42 @@
-# Agent Auto-Resume
+# RFC: Internal JWT Minting for Agent Auto-Resume
 
 Status: Draft
 
 ## Summary
 
-**Agent auto-resume** is the mechanism that wakes a paused agent sandbox when a user attempts to connect to it. Today, this works natively for **interactive CLI and SSH sessions**: when a user executes a command, the system reads their authentication token, checks the Sandbox Custom Resource for the `agent-id` label, and explicitly resumes the agent on their behalf. 
+**Agent auto-resume** is the mechanism that wakes a paused agent sandbox when a user attempts to connect to it. This RFC proposes how this will work natively for **interactive CLI and SSH sessions**: when a user executes a command, the system reads their authentication token, checks the Sandbox Custom Resource for the `agent-id` label, and explicitly resumes the agent on their behalf. 
 
 Auto-resuming via **Web UI sessions** presents a different challenge. Browsers rely on session cookies. When a request comes in, the edge auth service validates and strips the cookie before routing traffic to the internal `sandbox-activator`. 
 
-When the `sandbox-activator` receives traffic for a paused agent, it must forward a Resume request to the Control Plane (CP). The CP needs to authenticate this request. However, because the cookie was already stripped at the edge, the activator has no identity context to send to the CP. Without this, the CP cannot authenticate *who* is attempting to wake the agent.
+When the `sandbox-activator` receives traffic for a paused agent, it must forward a Resume request to the Control Plane (CP). The CP needs to authenticate this request. However, because the cookie was already stripped at the edge, the activator has no identity context to send to the CP. Without this, the CP cannot authenticate *who* is attempting to wake the agent, and because the CP only authenticates API Keys and JWTs (enforced via `pkg/middleware`), it rejects the request.
 
 This document explores approaches to solve this problem. We must find a secure way to pass the user's identity to the Control Plane during Web UI sessions. Identifying the user is a strict requirement to ensure accurate billing, security, and clear audit traces.
 
 The target access patterns are:
 - **CLI/SSH.** A developer runs commands or SSHs directly into the agent. 
-- **Web UI.** A user accesses an agent's exposed preview port (e.g., port 3000) via a browser session.
+- **Web UI.** A user interacts with the OpenClaw or OpenCode sandbox proxy via a browser session.
 
-## Approach followed when user interacts with agent-backed sandbox using external API key
 
-When a user interacts with a sandbox by providing an external API key (e.g., for SSH, Exec, or File Ops), the system uses the following approach to auto-resume the agent.
+## Proposed Flow 1: API-key auto-resume
+
+When a user interacts with a sandbox by providing an external API key (e.g., for SSH, Exec, or File Ops), the system will use the following approach to auto-resume the agent.
+
 
 **Flow Details:**
 1. **Client Request:** A client (e.g., MCP router or SDK) sends a request to an **agent-backed sandbox** using an API key. This request hits the **sandbox-ingress-gateway** (an Envoy chain + forward proxy) in the Data Plane.
-2. **Authorization & State Check:** The gateway makes an `ext_authz` call to the **auth-service** for authorization and liveness checks (operating on a tight 250ms budget).
+2. **Authorize:** The gateway makes an `ext_authz` call to the **auth-service** for authorization and liveness checks (operating on a tight 250ms budget).
 3. **Upstream Routing:** If the agent is paused, the `auth-service` instructs the gateway to dynamically set the upstream destination to the **sandbox-activator**.
 4. **Forwarding:** The gateway forwards the original request to the `sandbox-activator`, which uses hold, single-flight, and forward logic.
 5. **CR Lookup:** The `sandbox-activator` queries the Kubernetes **Sandbox CR** (whose state is persisted in `etcd`) to check for the presence of the `agent-id` label.
-6. **Triggering CP:** The activator sends a resume request (passing along the caller's API key) through the **Istio internal gateway** to the **aiagent-service** in the Control Plane. 
+6. **CR Response:** The label status is returned to the activator.
+7. **Triggering CP:** The activator sends a resume request (passing along the caller's API key) through the **Istio internal gateway** (the DP-to-CP path secured with an internal CA) to the **aiagent-service** in the Control Plane. 
    - **If `agent-id` is present:** It calls the `ResumeAgent` API.
    - **If `agent-id` is missing:** It calls the standard `ResumeSandbox` API.
    The CP service evaluates API key scopes, validates funds, and processes snapshot and restore annotations to unpause the agent.
-7. **Holding & Proxying:** The activator holds the original request until the agent transitions to `Ready`. Once ready, it proxies the connection back to the **sandbox-ingress-gateway**.
-8. **Re-Authorization & Final Routing:** The gateway receives the proxied request and once again makes an `ext_authz` call to the **auth-service**. Because the agent is now running, the auth-service allows the request and routes the traffic to `sandboxd` (port 44772) on the resumed agent.
-9. **Response:** The response is finally returned to the client.
+8. **Holding & Proxying:** The activator holds the original request until the agent transitions to `Ready`. Once ready, it proxies the connection back to the **sandbox-ingress-gateway**.
+9. **Re-Authorization:** The gateway receives the proxied request and once again makes an `ext_authz` call to the **auth-service**. 
+10. **Final Routing:** Because the agent is now running, the auth-service allows the request and routes the traffic to `sandboxd` (port 44772) on the resumed agent.
+11. **Response:** The response is finally returned to the client.
 
 ```mermaid
 flowchart LR
@@ -70,21 +74,9 @@ flowchart LR
     classDef store fill:#e6e9ef,stroke:#5b6472,color:#20233a
 ```
 
----
-
-## Approaches for Web UI Sessions (Browser)
-
-> [!NOTE]
-> **Explicit Failures for Preview URLs and Connect-Tokens**
-> A preview URL request against a paused **agent-backed sandbox** must fail without triggering a resume, and the agent-backed sandbox must remain paused. The same assertion applies for a connect-token request.
-> We should only allow auto-resume to be triggered via the main Web UI, explicitly failing and preventing auto-resume for preview URLs and connect-tokens.
-> **Reasoning:** Preview URLs can often be accessed by unauthenticated external users or automated scanners. Allowing these endpoints to trigger auto-resume could lead to unintended wake-ups, draining user funds and incurring unexpected compute costs. By restricting auto-resume strictly to the main Web UI (and authorized API keys), we guarantee that agents are only awakened by intentional actions from the rightful owners.
+## Flow 2: Web UI auto-resume
 
 When resuming an **agent-backed sandbox** via a Web UI, the browser uses a session Cookie. The challenge here is that the Auth Service validates and strips this Cookie before forwarding the request to the `sandbox-activator`. 
-
-> [!NOTE]
-> **Why is the cookie stripped?**
-> The `auth-service` intentionally deletes the session cookie at the edge gateway for security and least-privilege. Sandboxes run untrusted code; if the raw session cookie were passed through to the `sandboxd` container, malicious code could steal the cookie and hijack the user's entire NeevAI platform session. By stripping it at the edge, the internal services and sandboxes are kept secure.
 
 Because the cookie is deleted at the edge, the `sandbox-activator` receives the request without any user identity. If the activator attempts to send a resume request to the Control Plane without these authentication fields, the request will be rejected.
 
@@ -96,14 +88,13 @@ The `auth-service` acts as a token-exchange layer, minting a secure internal JWT
 
 **How it works:**
 1. The **sandbox-ingress-gateway** receives the Web UI request and triggers `ext_authz` on the **auth-service**.
-2. The `auth-service` validates the session cookie, extracts the user ID, and **mints a short-lived internal JWT**. 
-3. The `auth-service` injects this JWT as an `Authorization` Bearer token and securely strips the raw session cookie.
+2. The `auth-service` validates the session cookie, extracts the user ID, and **mints a narrow, single-purpose internal JWT** (resume token). 
+3. The `auth-service` injects this JWT into a custom header named `X-Neev-Resume-Token`. It explicitly avoids using the standard `Authorization` header so it doesn't accidentally overwrite or erase passwords needed by web apps running inside the user's sandbox (like Code Server). The `auth-service` also leaves the user's original session cookie attached to the request.
 4. The gateway routes the suspended request to the `sandbox-activator`.
-5. The activator forwards the Resume request (passing the internal JWT) to the **aiagent-service** (Control Plane) to unpause the agent.
+5. The activator extracts the `X-Neev-Resume-Token`, forwards the Resume request (passing the token) to the **aiagent-service** (Control Plane) to unpause the agent, and drops the token. Its single-flight key is based on `sandbox_id` plus user, rather than the raw token.
 6. The activator holds the user's original HTTP connection open while it waits for the agent Pod to become `Ready`.
-7. Once `Ready`, the activator proxies the connection (with the internal JWT still attached) back to the **sandbox-ingress-gateway**.
-8. The gateway runs `ext_authz` again. The **auth-service** validates the internal JWT and MUST explicitly strip the `Authorization` header to prevent the internal JWT from leaking into the untrusted `sandboxd` container. Once stripped, it routes the traffic to the sandbox.
-
+7. Once `Ready`, the activator proxies the connection (with the original session cookie still attached) back to the **sandbox-ingress-gateway**.
+8. The gateway runs `ext_authz` again. Because the cookie was preserved, this functions as an ordinary cookie validation. The **auth-service** validates the request, and the gateway strips the cookie and any `X-Neev-Resume-Token` headers before routing the traffic to the untrusted `sandboxd` container.
 
 ```mermaid
 flowchart LR
@@ -123,14 +114,16 @@ flowchart LR
 
     cl -->|"1 GET / (cookie)"| gw
     gw -->|"2 authorize"| az
-    az -->|"3 suspended + strip cookie + inject internal JWT →<br/>upstream = activator"| gw
-    gw -->|"4 forward req (with internal JWT)"| act
-    act -->|"5 resume (forwards internal JWT)"| igw
+    az -->|"3 suspended + keep cookie + inject X-Neev-Resume-Token →<br/>upstream = activator"| gw
+    gw -->|"4 forward req (cookie + resume token)"| act
+    act -->|"5 resume (uses resume token, drops it)"| igw
     igw --> cp
-    act -->|"6 hold until Ready, then proxy"| gw
-    gw -->|"7 authorize (again)"| az
-    az -->|"8 running (route to sandbox)"| sd
-    sd -.->|"9 response"| cl
+    cp -.->|"6 Agent awakened response"| igw
+    igw -.->|"7 Return success"| act
+    act -->|"8 hold until Ready, then proxy (cookie)"| gw
+    gw -->|"9 authorize (standard cookie pass)"| az
+    az -->|"10 running (strip headers, route to sandbox)"| sd
+    sd -.->|"11 response"| cl
 
     classDef cp fill:#e7e6fb,stroke:#6b6be0,color:#20233a
     classDef dp fill:#cdeee7,stroke:#12a594,color:#10302b
@@ -138,10 +131,63 @@ flowchart LR
     classDef store fill:#e6e9ef,stroke:#5b6472,color:#20233a
 ```
 
-### Rejected Alternatives
+### Token Design
+
+To securely propagate user identity to the Control Plane, the `auth-service` will generate a short-lived internal JWT with the following specifications:
+
+#### Token Lifecycle Flow
+```mermaid
+flowchart LR
+    ui["User Browser"]:::store
+
+    subgraph DP [Data Plane]
+        auth["auth-service"]:::dp
+    end
+
+    subgraph CP [Control Plane]
+        api["Control Plane API"]:::cp
+    end
+
+    ui -->|"1. Click Open Terminal"| api
+    api -.->|"2. Return connect-token"| ui
+    ui -->|"3. Pass connect-token"| auth
+    auth -.->|"4. Validate token & Set uisession cookie"| ui
+    
+    ui -->|"5. Web request (uisession cookie)"| auth
+    auth -->|"6. Mint Internal JWT (Private Key)"| auth
+    auth -->|"7. Wake Request + Internal JWT"| api
+    api -->|"8. Validate JWT & Run Authz checks"| api
+    api -.->|"9. Wakes the Agent"| auth
+
+    classDef cp fill:#e7e6fb,stroke:#6b6be0,color:#20233a
+    classDef dp fill:#cdeee7,stroke:#12a594,color:#10302b
+    classDef store fill:#e6e9ef,stroke:#5b6472,color:#20233a
+```
+
+1. **Key management and signing**
+   - The token uses asymmetric signing (e.g., Ed25519). To support this, we must generate a dedicated key pair and configure the **Internal Private Key in the Data Plane** (`auth-service`) to mint tokens, and the **Internal Public Key in the Control Plane** (`aiagent-service`) to verify them.
+   - **Why not reuse the existing HMAC secret?** We cannot reuse the existing `UI_SESSION_KEY` because it creates a massive security vulnerability. If a hacker breaches the Data Plane and steals this master secret, they could forge global user tokens, gain unauthorized access to the Control Plane, and wake or control any agent in the entire platform. Using a dedicated asymmetric key prevents a compromised Data Plane from forging full-access user tokens.
+2. **Token Payload (Claims)**
+   - **Identity:** Must include `sub` (user ID), `org_id`, `project_id`, `sandbox_id`, `agent_id`, and `plan_id`.
+   - **Metadata:** Must include `aud` (`aiagent-service`), `iss` (`auth-service` with region), `exp` (expiration), `jti` (unique identifier), and `scope=resume`.
+3. **Token Lifetime and Scope**
+   - The token enforces a strict 120-second TTL (`exp`). This window accommodates network propagation and subsequent agent boot times while minimizing the risk of token leakage.
+   - The token is strictly single-purpose and scoped to the target sandbox. 
+   - Replay attacks are mitigated by tracking the unique `jti` claim on the Control Plane to enforce single-use semantics.
+4. **User ID Source**
+   - The `auth-service` extracts the User ID directly from the user's `uisession` cookie.
+5. **Control Plane Validation**
+   - The Control Plane must be updated to validate the internal JWT using the trusted public keys. Once authenticated, the existing authorization pipeline will automatically enforce standard checks (e.g., billing, permissions), exactly as it currently does for standard UI tokens.
+
+## Security
+- The internal JWT (resume token) minted by `auth-service` is strictly short-lived and only valid for internal service-to-service communication.
+- The `X-Neev-Resume-Token` header and the raw session cookie are strictly stripped by the gateway before requests are finally routed into the untrusted `sandboxd` environment.
+
+## Rejected Alternatives
 
 | Approach | Concept | Reason for Rejection |
 | :--- | :--- | :--- |
 | **Auth Service Header Injection** | `auth-service` validates and strips cookie, injecting an `X-Neev-User-ID: <uuid>` plain-text header. Activator forwards this User ID header to the CP. | **CP Validation Failure:** The Control Plane authenticates requests using API Keys or JWTs. It will reject the request because it cannot authorize actions based purely on a plain-text User ID. |
 | **Server API Key Bypass** | Activator bypasses user validation by injecting a master `Server API Key` to authenticate the Resume request against the CP. | **Breaks Tracing & Billing:** While this bypasses CP validation, it destroys user-level tracing and accurate billing attribution. The Control Plane logs the action under the Server identity, completely losing the identity of the user who initiated the resume. |
-| **Direct Cookie Pass-through** | `auth-service` is configured to stop stripping the cookie. The raw cookie is forwarded directly to the `sandbox-activator` and CP for validation. | **CP Validation Failure & Security Risk:** If the activator forwards the raw cookie to the Control Plane to resume the agent, the CP will reject the request because it only authenticates API Keys and JWTs, not cookies. Additionally, this leaks highly-sensitive cookies to the Data Plane, risking session hijacking. |
+| **Authorization Header Overwrite** | `auth-service` injects the internal JWT into the `Authorization` header instead of a custom header. | **Breaks Sandbox Apps:** Web applications running inside the user's sandbox (e.g., Code Server) may rely on their own `Authorization` headers. Overwriting or stripping this header at the edge breaks native application functionality. |
+| **CP-Minted Resume Token** | The console, which issues connect-tokens, includes a resume-capable claim in the token it creates for the browser. This keeps a single signing authority in the CP, and the DP only verifies. | **Changes Console Flow:** This shifts the burden to the console and requires expanding the connect-token payload and altering the console's token generation flow to anticipate resume events. |

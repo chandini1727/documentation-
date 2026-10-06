@@ -17,7 +17,7 @@ The target access patterns are:
 - **Web UI.** A user interacts with the OpenClaw or OpenCode sandbox proxy via a browser session.
 
 
-## Proposed Flow 1: API-key auto-resume
+## Flow 1: API-key auto-resume
 
 When a user interacts with a sandbox by providing an external API key (e.g., for SSH, Exec, or File Ops), the system will use the following approach to auto-resume the agent.
 
@@ -31,7 +31,7 @@ When a user interacts with a sandbox by providing an external API key (e.g., for
 6. **CR Response:** The label status is returned to the activator.
 7. **Triggering CP:** The activator sends a resume request (passing along the caller's API key) through the **Istio internal gateway** (the DP-to-CP path secured with an internal CA) to the **aiagent-service** in the Control Plane. 
    - **If `agent-id` is present:** It calls the `ResumeAgent` API.
-   - **If `agent-id` is missing:** It calls the standard `ResumeSandbox` API.
+   - **If `agent-id` is missing:** It calls the standard `ResumeSandbox` API (returns **409 Conflict** if the sandbox is actually agent-backed).
    The CP service evaluates API key scopes, validates funds, and processes snapshot and restore annotations to unpause the agent.
 8. **Holding & Proxying:** The activator holds the original request until the agent transitions to `Ready`. Once ready, it proxies the connection back to the **sandbox-ingress-gateway**.
 9. **Re-Authorization:** The gateway receives the proxied request and once again makes an `ext_authz` call to the **auth-service**. 
@@ -65,8 +65,10 @@ flowchart LR
     igw --> cp
     act -->|"8 hold until Ready, then proxy"| gw
     gw -->|"9 authorize (again)"| az
-    az -->|"10 running (route to sandbox)"| sd
-    sd -.->|"11 response"| cl
+    az -.->|"10 running (OK)"| gw
+    gw -->|"11 route to sandbox"| sd
+    sd -.->|"12 response"| gw
+    gw -.->|"13 response"| cl
 
     classDef cp fill:#e7e6fb,stroke:#6b6be0,color:#20233a
     classDef dp fill:#cdeee7,stroke:#12a594,color:#10302b
@@ -122,8 +124,10 @@ flowchart LR
     igw -.->|"7 Return success"| act
     act -->|"8 hold until Ready, then proxy (cookie)"| gw
     gw -->|"9 authorize (standard cookie pass)"| az
-    az -->|"10 running (strip headers, route to sandbox)"| sd
-    sd -.->|"11 response"| cl
+    az -.->|"10 running (OK)"| gw
+    gw -->|"11 strip headers, route to sandbox"| sd
+    sd -.->|"12 response"| gw
+    gw -.->|"13 response"| cl
 
     classDef cp fill:#e7e6fb,stroke:#6b6be0,color:#20233a
     classDef dp fill:#cdeee7,stroke:#12a594,color:#10302b
@@ -165,8 +169,9 @@ flowchart LR
 ```
 
 1. **Key management and signing**
-   - The token uses asymmetric signing (e.g., Ed25519). To support this, we must generate a dedicated key pair and configure the **Internal Private Key in the Data Plane** (`auth-service`) to mint tokens, and the **Internal Public Key in the Control Plane** (`aiagent-service`) to verify them.
+   - The token uses asymmetric signing. To support this, we must generate a dedicated key pair and configure the **Internal Private Key in the Data Plane** (`auth-service`) to mint tokens, and the **Internal Public Key in the Control Plane** (`aiagent-service`) to verify them.
    - **Why not reuse the existing HMAC secret?** We cannot reuse the existing `UI_SESSION_KEY` because it creates a massive security vulnerability. If a hacker breaches the Data Plane and steals this master secret, they could forge global user tokens, gain unauthorized access to the Control Plane, and wake or control any agent in the entire platform. Using a dedicated asymmetric key prevents a compromised Data Plane from forging full-access user tokens.
+   - **Performance:** Generating this token in the `auth-service` is extremely fast (typically **< 1-2 milliseconds**). This ensures that the token minting process easily fits within the strict 250ms latency budget allocated for the `ext_authz` call.
 2. **Token Payload (Claims)**
    - **Identity:** Must include `sub` (user ID), `org_id`, `project_id`, `sandbox_id`, `agent_id`, and `plan_id`.
    - **Metadata:** Must include `aud` (`aiagent-service`), `iss` (`auth-service` with region), `exp` (expiration), `jti` (unique identifier), and `scope=resume`.
@@ -178,6 +183,14 @@ flowchart LR
    - The `auth-service` extracts the User ID directly from the user's `uisession` cookie.
 5. **Control Plane Validation**
    - The Control Plane must be updated to validate the internal JWT using the trusted public keys. Once authenticated, the existing authorization pipeline will automatically enforce standard checks (e.g., billing, permissions), exactly as it currently does for standard UI tokens.
+6. **Injected Header Structure**
+   - When the `auth-service` injects the internal JWT, the HTTP request forwarded to the `sandbox-activator` will be structured like this:
+   ```http
+   GET / HTTP/1.1
+   Host: <sandbox-id>.proxy.neevcloud.com
+   Cookie: uisession=<original_session_cookie>
+   X-Neev-Resume-Token: eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9...
+   ```
 
 ## Security
 - The internal JWT (resume token) minted by `auth-service` is strictly short-lived and only valid for internal service-to-service communication.
@@ -190,4 +203,3 @@ flowchart LR
 | **Auth Service Header Injection** | `auth-service` validates and strips cookie, injecting an `X-Neev-User-ID: <uuid>` plain-text header. Activator forwards this User ID header to the CP. | **CP Validation Failure:** The Control Plane authenticates requests using API Keys or JWTs. It will reject the request because it cannot authorize actions based purely on a plain-text User ID. |
 | **Server API Key Bypass** | Activator bypasses user validation by injecting a master `Server API Key` to authenticate the Resume request against the CP. | **Breaks Tracing & Billing:** While this bypasses CP validation, it destroys user-level tracing and accurate billing attribution. The Control Plane logs the action under the Server identity, completely losing the identity of the user who initiated the resume. |
 | **Authorization Header Overwrite** | `auth-service` injects the internal JWT into the `Authorization` header instead of a custom header. | **Breaks Sandbox Apps:** Web applications running inside the user's sandbox (e.g., Code Server) may rely on their own `Authorization` headers. Overwriting or stripping this header at the edge breaks native application functionality. |
-| **CP-Minted Resume Token** | The console, which issues connect-tokens, includes a resume-capable claim in the token it creates for the browser. This keeps a single signing authority in the CP, and the DP only verifies. | **Changes Console Flow:** This shifts the burden to the console and requires expanding the connect-token payload and altering the console's token generation flow to anticipate resume events. |

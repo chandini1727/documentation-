@@ -1,4 +1,4 @@
-# RFC: Internal JWT Minting for Agent Auto-Resume
+# RFC: JWT Extraction from Session Cookies for Web UI Auto-Resume
 
 Status: Draft
 
@@ -84,13 +84,14 @@ Because the cookie is deleted at the edge, the `sandbox-activator` receives the 
 
 To resolve this identity propagation issue, the following architecture defines how to securely pass the user's identity to the Control Plane.
 
-### Auth Service Cookie JWT Extraction
+### Extracting the JWT from the Cookie
 
 The `auth-service` acts as a token-extraction layer, retrieving the existing JWT from the user's session cookie and forwarding it so the Control Plane can natively validate and authenticate the user.
 
 **How it works:**
 1. The **sandbox-ingress-gateway** receives the Web UI request and triggers `ext_authz` on the **auth-service**.
 2. The `auth-service` validates the session cookie and **extracts the existing JWT directly from the cookie**. 
+    * **Expired Cookie Handling:** If the cookie is expired, the `auth-service` does **not** fail the request. Instead, it forwards the request to the Control Plane indicating the user's intent to connect. The Control Plane verifies the user's expired token, automatically generates a new `ConnectToken`, and sends it to the Data Plane. The Data Plane then generates a fresh session cookie for the user. This creates a seamless, automatic reconnect without confusing the user with a login redirect.
 3. The `auth-service` injects this existing JWT into a custom header named `X-Neev-Resume-Token`. It explicitly avoids using the standard `Authorization` header so it doesn't accidentally overwrite or erase passwords needed by web apps running inside the user's sandbox (like Code Server). The `auth-service` also leaves the user's original session cookie attached to the request.
 4. The gateway routes the suspended request to the `sandbox-activator`.
 5. The `sandbox-activator` extracts the JWT from the `X-Neev-Resume-Token` header and securely forwards it to the **aiagent-service** (Control Plane) to authenticate the Resume request and wake the agent.
@@ -118,9 +119,9 @@ flowchart LR
     gw --->|"2 authorize"| az
     az -..->|"3 suspended → instruct:<br/>keep cookie, inject extracted token,<br/>upstream = activator"| gw
     gw --->|"4 forward req (cookie + extracted token)"| act
-    act --->|"5 resume (pass token, drop it)"| igw
+    act --->|"5 resume API<br/>(pass token)"| igw
     igw ---> cp
-    cp -..->|"6 Agent awakened"| igw
+    cp -..->|"6 Verified & Awakened"| igw
     igw -..->|"7 Return success"| act
     act --->|"8 hold until Ready, proxy (cookie)"| gw
     gw --->|"9 authorize (cookie pass)"| az
@@ -142,6 +143,8 @@ Because this approach reuses the Data Plane's `uisession` token for Control Plan
 1. **Key Distribution to Control Plane:** Currently, the Control Plane (`aiagent-service` and `tenant-service`) only possesses the `CONNECT_TOKEN_KEY`. To verify the extracted cookie token, we must securely inject the Data Plane's `UI_SESSION_KEY` into the CP's configuration.
 2. **Middleware Updates:** The Control Plane normally authenticates internal requests using standard API Keys or CP-specific tokens. The authentication middleware must be modified to explicitly accept, parse, and trust `uisession` claims so the CP can authenticate the user and check billing.
 3. **Tenant Service Blast Radius:** The extracted token is an 8-hour master session key. While it is strictly scoped to one specific sandbox (so attackers cannot access other sandboxes), it lacks a strict `scope=resume` restriction. If intercepted on the internal network, an attacker could bypass the `tenant-service`'s API protections and execute unauthorized lifecycle operations (e.g., permanently deleting or pausing) on that specific sandbox directly from the CP.
+4. **Risk of Infrastructure Breach:** Even though the master key (`UI_SESSION_KEY`) is safely stored in GitHub Secrets, it must still be loaded into the memory of the backend servers. If a malicious actor breaches the live infrastructure and extracts the key from memory, they could use it to forge tokens and gain unauthorized access to any sandbox.
+5. **Replay Attack & DoS Risk:** Forwarding a long-lived session token introduces a replay attack vector. An intercepted token could be repeatedly submitted to exhaust Control Plane resources and trigger a Denial of Service (DoS).
 
 ## Security
 - The extracted JWT is a long-lived master session token. Care must be taken to ensure it is not logged or leaked internally.
@@ -154,3 +157,4 @@ Because this approach reuses the Data Plane's `uisession` token for Control Plan
 | **Auth Service Header Injection** | `auth-service` validates and strips cookie, injecting an `X-Neev-User-ID: <uuid>` plain-text header. Activator forwards this User ID header to the CP. | **CP Validation Failure:** The Control Plane authenticates requests using API Keys or JWTs. It will reject the request because it cannot authorize actions based purely on a plain-text User ID. |
 | **Server API Key Bypass** | Activator bypasses user validation by injecting a master `Server API Key` to authenticate the Resume request against the CP. | **Breaks Tracing & Billing:** While this bypasses CP validation, it destroys user-level tracing and accurate billing attribution. The Control Plane logs the action under the Server identity, completely losing the identity of the user who initiated the resume. |
 | **Authorization Header Overwrite** | `auth-service` injects the internal JWT into the `Authorization` header instead of a custom header. | **Breaks Sandbox Apps:** Web applications running inside the user's sandbox (e.g., Code Server) may rely on their own `Authorization` headers. Overwriting or stripping this header at the edge breaks native application functionality. |
+| **Asymmetric Key (RSA) Minting** | DP generates a new JWT signed with a Private RSA Key; CP verifies it using a Public Key. This is highly secure because even if the Public Key leaks, attackers cannot forge tokens. | **Key Management Overhead:** While extremely secure, it requires managing and rotating a brand new set of RSA keys across the platform. Since the DP and CP already share a secure symmetric secret (`UI_SESSION_KEY`), we chose to reuse the existing symmetric token to minimize architectural complexity. |

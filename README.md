@@ -55,20 +55,20 @@ flowchart LR
         cp["aiagent-service<br/>ResumeAgent OR ResumeSandbox<br/>api-key scope · funds · snapshot + restore annotations"]:::cp
     end
 
-    cl -->|"1 request to sb-abc"| gw
-    gw -->|"2 authorize"| az
-    az -->|"3 suspended + api-key →<br/>upstream = activator"| gw
-    gw -->|"4 forward original request"| act
-    act -->|"5 check agent-id label"| cr
-    cr -.->|"6 returns label status"| act
-    act -->|"7 resume (caller's api-key)<br/>ResumeAgent if label exists<br/>ResumeSandbox if missing"| igw
-    igw --> cp
-    act -->|"8 hold until Ready, then proxy"| gw
-    gw -->|"9 authorize (again)"| az
-    az -.->|"10 running (OK)"| gw
-    gw -->|"11 route to sandbox"| sd
-    sd -.->|"12 response"| gw
-    gw -.->|"13 response"| cl
+    cl --->|"1 request to sb-abc"| gw
+    gw --->|"2 authorize"| az
+    az -..->|"3 suspended → instruct:<br/>upstream = activator"| gw
+    gw --->|"4 forward original request"| act
+    act --->|"5 check agent-id label"| cr
+    cr -..->|"6 returns label status"| act
+    act --->|"7 resume (caller's api-key)<br/>ResumeAgent if label exists<br/>ResumeSandbox if missing"| igw
+    igw ---> cp
+    act --->|"8 hold until Ready, then proxy"| gw
+    gw --->|"9 authorize (again)"| az
+    az -..->|"10 running (OK)"| gw
+    gw --->|"11 route to sandbox"| sd
+    sd -..->|"12 response"| gw
+    gw -..->|"13 response"| cl
 
     classDef cp fill:#e7e6fb,stroke:#6b6be0,color:#20233a
     classDef dp fill:#cdeee7,stroke:#12a594,color:#10302b
@@ -84,19 +84,19 @@ Because the cookie is deleted at the edge, the `sandbox-activator` receives the 
 
 To resolve this identity propagation issue, the following architecture defines how to securely pass the user's identity to the Control Plane.
 
-### Auth Service Internal JWT Minting
+### Auth Service Cookie JWT Extraction
 
-The `auth-service` acts as a token-exchange layer, minting a secure internal JWT that the Control Plane can natively validate to authenticate the user.
+The `auth-service` acts as a token-extraction layer, retrieving the existing JWT from the user's session cookie and forwarding it so the Control Plane can natively validate and authenticate the user.
 
 **How it works:**
 1. The **sandbox-ingress-gateway** receives the Web UI request and triggers `ext_authz` on the **auth-service**.
-2. The `auth-service` validates the session cookie, extracts the user ID, and **mints a narrow, single-purpose internal JWT** (resume token). 
-3. The `auth-service` injects this JWT into a custom header named `X-Neev-Resume-Token`. It explicitly avoids using the standard `Authorization` header so it doesn't accidentally overwrite or erase passwords needed by web apps running inside the user's sandbox (like Code Server). The `auth-service` also leaves the user's original session cookie attached to the request.
+2. The `auth-service` validates the session cookie and **extracts the existing JWT directly from the cookie**. 
+3. The `auth-service` injects this existing JWT into a custom header named `X-Neev-Resume-Token`. It explicitly avoids using the standard `Authorization` header so it doesn't accidentally overwrite or erase passwords needed by web apps running inside the user's sandbox (like Code Server). The `auth-service` also leaves the user's original session cookie attached to the request.
 4. The gateway routes the suspended request to the `sandbox-activator`.
-5. The activator extracts the `X-Neev-Resume-Token`, forwards the Resume request (passing the token) to the **aiagent-service** (Control Plane) to unpause the agent, and drops the token. Its single-flight key is based on `sandbox_id` plus user, rather than the raw token.
+5. The `sandbox-activator` extracts the JWT from the `X-Neev-Resume-Token` header and securely forwards it to the **aiagent-service** (Control Plane) to authenticate the Resume request and wake the agent.
 6. The activator holds the user's original HTTP connection open while it waits for the agent Pod to become `Ready`.
 7. Once `Ready`, the activator proxies the connection (with the original session cookie still attached) back to the **sandbox-ingress-gateway**.
-8. The gateway runs `ext_authz` again. Because the cookie was preserved, this functions as an ordinary cookie validation. The **auth-service** validates the request, and the gateway strips the cookie and any `X-Neev-Resume-Token` headers before routing the traffic to the untrusted `sandboxd` container.
+8. The gateway runs `ext_authz` again. Because the cookie was preserved, this functions as an ordinary cookie validation. The **auth-service** validates the request and issues an instruction to the gateway to remove the session cookie and any `X-Neev-Resume-Token` headers. The gateway then executes this instruction, physically stripping the headers before routing the final traffic to the untrusted `sandboxd` container.
 
 ```mermaid
 flowchart LR
@@ -104,30 +104,30 @@ flowchart LR
 
     subgraph DP [Data Plane]
         gw["sandbox-ingress-gateway<br/>Envoy chain + forward proxy"]:::dp
-        az["auth-service ext_authz<br/>validate cookie + mint internal JWT"]:::dp
+        az["auth-service ext_authz<br/>validate cookie + extract JWT"]:::dp
         act["sandbox-activator<br/>hold · single-flight · proxy"]:::star
         igw["Istio internal gateway<br/>TLS 443 · internal CA"]:::dp
         sd["sandboxd :44772"]:::dp
     end
 
     subgraph CP [Control Plane]
-        cp["aiagent-service ResumeAgent<br/>validates JWT · user-id scope"]:::cp
+        cp["aiagent-service ResumeAgent<br/>validates existing cookie JWT"]:::cp
     end
 
-    cl -->|"1 GET / (cookie)"| gw
-    gw -->|"2 authorize"| az
-    az -->|"3 suspended + keep cookie + inject X-Neev-Resume-Token →<br/>upstream = activator"| gw
-    gw -->|"4 forward req (cookie + resume token)"| act
-    act -->|"5 resume (uses resume token, drops it)"| igw
-    igw --> cp
-    cp -.->|"6 Agent awakened response"| igw
-    igw -.->|"7 Return success"| act
-    act -->|"8 hold until Ready, then proxy (cookie)"| gw
-    gw -->|"9 authorize (standard cookie pass)"| az
-    az -.->|"10 running (OK)"| gw
-    gw -->|"11 strip headers, route to sandbox"| sd
-    sd -.->|"12 response"| gw
-    gw -.->|"13 response"| cl
+    cl --->|"1 GET / (cookie)"| gw
+    gw --->|"2 authorize"| az
+    az -..->|"3 suspended → instruct:<br/>keep cookie, inject extracted token,<br/>upstream = activator"| gw
+    gw --->|"4 forward req (cookie + extracted token)"| act
+    act --->|"5 resume (pass token, drop it)"| igw
+    igw ---> cp
+    cp -..->|"6 Agent awakened"| igw
+    igw -..->|"7 Return success"| act
+    act --->|"8 hold until Ready, proxy (cookie)"| gw
+    gw --->|"9 authorize (cookie pass)"| az
+    az -..->|"10 OK → instruct:<br/>strip cookie & resume token"| gw
+    gw --->|"11 strip headers & route to sandbox"| sd
+    sd -..->|"12 response"| gw
+    gw -..->|"13 response"| cl
 
     classDef cp fill:#e7e6fb,stroke:#6b6be0,color:#20233a
     classDef dp fill:#cdeee7,stroke:#12a594,color:#10302b
@@ -135,65 +135,16 @@ flowchart LR
     classDef store fill:#e6e9ef,stroke:#5b6472,color:#20233a
 ```
 
-### Token Design
+## Architectural & Security Implications
 
-To securely propagate user identity to the Control Plane, the `auth-service` will generate a short-lived internal JWT with the following specifications:
+Because this approach reuses the Data Plane's `uisession` token for Control Plane authentication, the following architectural changes and trade-offs must be accepted:
 
-#### Token Lifecycle Flow
-```mermaid
-flowchart LR
-    ui["User Browser"]:::store
-
-    subgraph DP [Data Plane]
-        auth["auth-service"]:::dp
-    end
-
-    subgraph CP [Control Plane]
-        api["Control Plane API"]:::cp
-    end
-
-    ui -->|"1. Click Open Terminal"| api
-    api -.->|"2. Return connect-token"| ui
-    ui -->|"3. Pass connect-token"| auth
-    auth -.->|"4. Validate token & Set uisession cookie"| ui
-    
-    ui -->|"5. Web request (uisession cookie)"| auth
-    auth -->|"6. Mint Internal JWT (Private Key)"| auth
-    auth -->|"7. Wake Request + Internal JWT"| api
-    api -->|"8. Validate JWT & Run Authz checks"| api
-    api -.->|"9. Wakes the Agent"| auth
-
-    classDef cp fill:#e7e6fb,stroke:#6b6be0,color:#20233a
-    classDef dp fill:#cdeee7,stroke:#12a594,color:#10302b
-    classDef store fill:#e6e9ef,stroke:#5b6472,color:#20233a
-```
-
-1. **Key management and signing**
-   - The token uses asymmetric signing. To support this, we must generate a dedicated key pair and configure the **Internal Private Key in the Data Plane** (`auth-service`) to mint tokens, and the **Internal Public Key in the Control Plane** (`aiagent-service`) to verify them.
-   - **Why not reuse the existing HMAC secret?** We cannot reuse the existing `UI_SESSION_KEY` because it creates a massive security vulnerability. If a hacker breaches the Data Plane and steals this master secret, they could forge global user tokens, gain unauthorized access to the Control Plane, and wake or control any agent in the entire platform. Using a dedicated asymmetric key prevents a compromised Data Plane from forging full-access user tokens.
-   - **Performance:** Generating this token in the `auth-service` is extremely fast (typically **< 1-2 milliseconds**). This ensures that the token minting process easily fits within the strict 250ms latency budget allocated for the `ext_authz` call.
-2. **Token Payload (Claims)**
-   - **Identity:** Must include `sub` (user ID), `org_id`, `project_id`, `sandbox_id`, `agent_id`, and `plan_id`.
-   - **Metadata:** Must include `aud` (`aiagent-service`), `iss` (`auth-service` with region), `exp` (expiration), `jti` (unique identifier), and `scope=resume`.
-3. **Token Lifetime and Scope**
-   - The token enforces a strict 120-second TTL (`exp`). This window accommodates network propagation and subsequent agent boot times while minimizing the risk of token leakage.
-   - The token is strictly single-purpose and scoped to the target sandbox. 
-   - Replay attacks are mitigated by tracking the unique `jti` claim on the Control Plane to enforce single-use semantics.
-4. **User ID Source**
-   - The `auth-service` extracts the User ID directly from the user's `uisession` cookie.
-5. **Control Plane Validation**
-   - The Control Plane must be updated to validate the internal JWT using the trusted public keys. Once authenticated, the existing authorization pipeline will automatically enforce standard checks (e.g., billing, permissions), exactly as it currently does for standard UI tokens.
-6. **Injected Header Structure**
-   - When the `auth-service` injects the internal JWT, the HTTP request forwarded to the `sandbox-activator` will be structured like this:
-   ```http
-   GET / HTTP/1.1
-   Host: <sandbox-id>.proxy.neevcloud.com
-   Cookie: uisession=<original_session_cookie>
-   X-Neev-Resume-Token: eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9...
-   ```
+1. **Key Distribution to Control Plane:** Currently, the Control Plane (`aiagent-service` and `tenant-service`) only possesses the `CONNECT_TOKEN_KEY`. To verify the extracted cookie token, we must securely inject the Data Plane's `UI_SESSION_KEY` into the CP's configuration.
+2. **Middleware Updates:** The Control Plane normally authenticates internal requests using standard API Keys or CP-specific tokens. The authentication middleware must be modified to explicitly accept, parse, and trust `uisession` claims so the CP can authenticate the user and check billing.
+3. **Tenant Service Blast Radius:** The extracted token is an 8-hour master session key. While it is strictly scoped to one specific sandbox (so attackers cannot access other sandboxes), it lacks a strict `scope=resume` restriction. If intercepted on the internal network, an attacker could bypass the `tenant-service`'s API protections and execute unauthorized lifecycle operations (e.g., permanently deleting or pausing) on that specific sandbox directly from the CP.
 
 ## Security
-- The internal JWT (resume token) minted by `auth-service` is strictly short-lived and only valid for internal service-to-service communication.
+- The extracted JWT is a long-lived master session token. Care must be taken to ensure it is not logged or leaked internally.
 - The `X-Neev-Resume-Token` header and the raw session cookie are strictly stripped by the gateway before requests are finally routed into the untrusted `sandboxd` environment.
 
 ## Rejected Alternatives

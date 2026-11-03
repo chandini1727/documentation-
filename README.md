@@ -251,8 +251,142 @@ flowchart LR
     classDef star fill:#ffe6a7,stroke:#d99a1c,stroke-width:2px,color:#3a2c07
     classDef store fill:#e6e9ef,stroke:#5b6472,color:#20233a
 ```
+# Flow 2: DRA Scheduling, Node Preparation & Container CDI Device Attachment
+
+### The Big Picture (What Flow 2 Does)
+
+At the end of Flow 1, your Pod was created in **`Pending`** state with a **`ResourceClaim`** asking for a GPU (e.g., RTX 5090 with ≥ 31GiB VRAM).
+
+Flow 2 is the engine that:
+
+1. **Finds** which server in the cluster has that exact free GPU.
+2. **Prepares** the hardware on that server (wipes old GPU memory).
+3. **Locks down & attaches** *only* that specific card into the container so other GPUs on that machine remain completely invisible.
+4. **Launches** the container, moving the Pod from **`Pending` → `Running`**.
 
 ---
+
+## Detailed Step-by-Step Breakdown
+
+### Phase 1: Finding & Locking the GPU (`kube-scheduler`)
+
+#### Step 1: Scheduler Detects the Pending Pod & Claim
+
+- The Kubernetes scheduler (`kube-scheduler`) picks up the newly created Pod from the queue.
+- It sees that the Pod cannot run yet because its attached **`ResourceClaim`** has not been allocated a physical GPU.
+
+#### Step 2: Evaluates Node Hardware Catalog (`ResourceSlice`)
+
+- Every GPU node in the cluster publishes an inventory list called a **`ResourceSlice`**. This list tells Kubernetes exactly what physical cards are installed (model name, available VRAM, PCIe addresses, and health status).
+- The scheduler runs the CEL search filter from the claim against all nodes:
+
+```cel
+device.attributes['gpu.nvidia.com'].productName == 'NVIDIA GeForce RTX 5090' &&
+device.capacity['gpu.nvidia.com'].memory >= 31Gi
+```
+
+#### Step 3: Locks the GPU and Binds the Pod
+
+- The scheduler finds a matching, healthy card: **`gpu-0`** on **`worker-3`**.
+- It writes `worker-3, gpu-0` into `ResourceClaim.status.allocation`. This **locks the GPU** so no other workload in the cluster can steal it.
+- The scheduler binds the Pod to `worker-3`.
+
+---
+
+### Phase 2: Node Hardware Preparation (`kubelet` & NVIDIA Driver)
+
+#### Step 4: Kubelet Receives the Workload
+
+- The **`kubelet`** agent running locally on `worker-3` receives notification that a new Pod has been assigned to its machine.
+- It inspects the Pod and detects that it requires a DRA device allocation (`gpu-claim`).
+
+#### Step 5: `NodePrepareResources` gRPC Call
+
+- To interact with physical PCIe cards, `kubelet` connects to the local **NVIDIA DRA Driver DaemonSet pod** running on that same server over a local UNIX domain socket (`/var/run/cdi/...`).
+- It invokes the gRPC function: **`NodePrepareResources`**.
+
+#### Step 6: Memory Wipe & CDI Instruction File Generation
+
+The NVIDIA driver daemon on `worker-3` does two critical jobs:
+
+1. **Security Memory Wipe:** It completely flushes and resets the physical VRAM and CUDA context of `gpu-0`. This guarantees that no leftover data, weights, or code from prior workloads can ever leak to the new user.
+2. **Generates the CDI JSON File:** It writes the **Container Device Interface (CDI)** instruction file directly to the host disk at `/var/run/cdi/nvidia.com-gpu.json`:
+
+```json
+{
+  "cdiVersion": "0.5.0",
+  "kind": "nvidia.com/gpu",
+  "devices": [
+    {
+      "name": "gpu-0",
+      "containerEdits": {
+        "deviceNodes": [
+          {"path": "/dev/nvidia0", "hostPath": "/dev/nvidia0"},
+          {"path": "/dev/nvidiactl", "hostPath": "/dev/nvidiactl"},
+          {"path": "/dev/nvidia-uvm", "hostPath": "/dev/nvidia-uvm"},
+          {"path": "/dev/nvidia-uvm-tools", "hostPath": "/dev/nvidia-uvm-tools"}
+        ],
+        "mounts": [
+          {
+            "hostPath": "/usr/lib/x86_64-linux-gnu/libcuda.so.1",
+            "containerPath": "/usr/lib/x86_64-linux-gnu/libcuda.so.1"
+          }
+        ]
+      }
+    }
+  ]
+}
+```
+
+*(This JSON file is the concrete instruction sheet telling the container runtime exactly which files to give the container).*
+
+---
+
+### Phase 3: Container Device Attachment & Process Launch (`containerd`)
+
+#### Step 7: Kubelet Calls Container Runtime
+
+- `kubelet` tells **`containerd`** to create the container and passes the CDI device identifier: `nvidia.com/gpu=gpu-0`.
+
+#### Step 8: `containerd` Reads the CDI Instructions
+
+- `containerd` reads `/var/run/cdi/nvidia.com-gpu.json` and prepares to unlock two Linux kernel security gates.
+
+#### Step 9: Gate 1 — Device Node Injection (Private `/dev`)
+
+- By default, a Linux container has an empty `/dev` directory with zero GPU devices.
+- `containerd` injects **ONLY** the files needed for `gpu-0`:
+  - `/dev/nvidia0`: The direct data pipeline to physical GPU 0.
+  - `/dev/nvidiactl`: The master control switch for hardware initialization and telemetry.
+  - `/dev/nvidia-uvm`: Unified Virtual Memory (direct CPU ↔ GPU memory sharing).
+  - `/dev/nvidia-uvm-tools`: Profiling interface for PyTorch/CUDA profilers.
+  - `libcuda.so.1`: The host CUDA driver library (mounted read-only).
+- **Strict Isolation:** If the host machine has 8 physical GPUs (`gpu-0` to `gpu-7`), the other 7 cards (`/dev/nvidia1` through `/dev/nvidia7`) are **not injected**. They simply do not exist inside your container.
+
+#### Step 10: Gate 2 — Linux Kernel Security Filter (Cgroups v2)
+
+- Even if a malicious user inside the container attempts to access other GPUs by guessing device numbers, the Linux kernel **Cgroups v2 device controller** strictly blocks it.
+- `containerd` configures the kernel rule: Allow `read / write / mknod` **ONLY for device `gpu-0`**. Any call to other device IDs is rejected by the Linux kernel.
+
+#### Step 11: Mount Storage & Start the Container
+
+- `containerd` mounts the storage volume at `/data/workspace` (either the Ceph PVC if requested, or the temporary `emptyDir` scratch disk).
+- It executes the container entrypoint process:
+
+```bash
+jupyter lab --ip 0.0.0.0 --port 8888
+```
+
+#### Step 12: Pod Transitions to `Running`
+
+- The container is now healthy and active.
+- Kubernetes updates the Pod status from **`Pending` → `Running`**.
+
+---
+
+## Flow 2 Diagram (RFC Style)
+
+```mermaid
 flowchart LR
     subgraph CP [Cluster Control Plane]
         rc[("ResourceClaim<br/>(RTX 5090 >= 31Gi)")]:::store
@@ -286,7 +420,7 @@ flowchart LR
     classDef dp fill:#cdeee7,stroke:#12a594,color:#10302b
     classDef star fill:#ffe6a7,stroke:#d99a1c,stroke-width:2px,color:#3a2c07
     classDef store fill:#e6e9ef,stroke:#5b6472,color:#20233a
-
+```
 ---
 
 ## Flow 3: Interactive Ingress Routing & Release on Stop

@@ -253,60 +253,39 @@ flowchart LR
 ```
 
 ---
-
-## Flow 2: DRA Scheduling, Node Preparation & Container CDI Attachment
-
-This is the core DRA engine. The Kubernetes scheduler matches the CEL claim against physical node inventory, and the GPU worker node prepares the PCIe device and uses the Container Device Interface (CDI) to attach only the allocated GPU to the container.
-
-### Flow Details:
-
-1. **Read Claim:** `kube-scheduler` detects the pending Pod and inspects its associated `ResourceClaim`.
-2. **Match Inventory:** The scheduler compares the CEL request with the **ResourceSlice** inventory published by cluster nodes.
-3. **Lock & Bind:** The scheduler matches physical `gpu-0` on `worker-3`, writes `worker-3, gpu-0` into `ResourceClaim.status.allocation`, and binds the Pod to `worker-3`.
-4. **Node Notification:** The `kubelet` agent on `worker-3` detects the assigned Pod and identifies that it requires a DRA device.
-5. **NodePrepareResources Call:** `kubelet` connects to the **NVIDIA DRA Driver DaemonSet pod** running locally on `worker-3` via a local UNIX socket gRPC endpoint (`NodePrepareResources`).
-6. **Hardware Reset & CDI Generation:** The NVIDIA DRA driver validates `gpu-0`, clears prior memory/contexts, and writes the host CDI specification file to `/var/run/cdi/nvidia.com-gpu.json`.
-7. **Initiate Container Creation:** `kubelet` commands **containerd** to create the container with the allocated CDI device reference (`nvidia.com/gpu=gpu-0`).
-8. **Read CDI Sheet:** `containerd` reads `/var/run/cdi/nvidia.com-gpu.json` to extract required device nodes and library bind mounts.
-9. **Gate 1 (Device Nodes):** `containerd` injects only `/dev/nvidia0`, `/dev/nvidiactl`, `/dev/nvidia-uvm`, and `/dev/nvidia-uvm-tools` into the container's private `/dev` directory. All other host GPUs (`nvidia1`–`nvidia7`) are completely hidden.
-10. **Gate 2 (Cgroups v2):** `containerd` writes the cgroup device filter rules allowing read/write/mknod **only to `gpu-0`**, strictly blocking access to any other device ID on the host.
-11. **Mount Storage & Entrypoint:** `containerd` mounts the Ceph PVC to `/data/workspace` and starts `jupyter lab --ip 0.0.0.0 --port 8888`. The Pod transitions from `Pending` to **`Running`**.
-
-```mermaid
 flowchart LR
-    subgraph WK["Workload Cluster Control Plane"]
-        rc[("ResourceClaim<br/>RTX 5090 >= 31Gi")]
-        rs[("ResourceSlice<br/>Node GPU Catalog")]
-        sched["kube-scheduler<br/>DRA Plugin"]
+    subgraph CP [Cluster Control Plane]
+        rc[("ResourceClaim<br/>(RTX 5090 >= 31Gi)")]:::store
+        rs[("ResourceSlice<br/>(Node GPU Catalog)")]:::store
+        sched["kube-scheduler<br/>(DRA Plugin)"]:::cp
     end
 
-    subgraph DP["GPU Worker Node - worker-3"]
-        klet["kubelet agent"]
-        dra["NVIDIA DRA Driver<br/>DaemonSet (UNIX socket)"]
-        cdi[("CDI JSON Spec<br/>/var/run/cdi/...")]
-        ctrd["containerd runtime"]
-        dev["Gate 1: Injected /dev<br/>/dev/nvidia0, nvidiactl"]
-        cg["Gate 2: Cgroups v2<br/>Allow ONLY gpu-0"]
-        app["AIRuntime Pod<br/>jupyter lab :8888 (Running)"]
+    subgraph DP [GPU Worker Node — worker-3]
+        klet["kubelet Agent"]:::dp
+        dra["NVIDIA DRA Driver<br/>DaemonSet (UNIX socket)"]:::star
+        cdi[("CDI JSON Spec<br/>/var/run/cdi/...")]:::store
+        ctrd["containerd Runtime"]:::dp
+        dev["Gate 1: Isolated /dev<br/>/dev/nvidia0, uvm, ctl"]:::dp
+        cg["Gate 2: Cgroups v2<br/>Allow: gpu-0 ONLY"]:::dp
+        app["AIRuntime Pod<br/>JupyterLab :8888 (Running)"]:::dp
     end
 
-    rc -->|"1 read claim"| sched
-    rs -.->|"2 match inventory"| sched
-    sched -->|"3 lock gpu-0 & bind Pod"| klet
-    klet -->|"4 NodePrepareResources"| dra
-    dra -->|"5 reset VRAM & write spec"| cdi
-    klet -->|"6 run container"| ctrd
-    cdi -.->|"7 read instructions"| ctrd
-    ctrd -->|"8 populate /dev"| dev
-    ctrd -->|"9 set device filter"| cg
-    dev --> app
-    cg --> app
+    rc --->|"1 read claim"| sched
+    rs -..->|"2 evaluate CEL catalog"| sched
+    sched --->|"3 lock gpu-0 & bind Pod"| klet
+    klet --->|"4 NodePrepareResources"| dra
+    dra --->|"5 wipe VRAM & generate spec"| cdi
+    klet --->|"6 create container"| ctrd
+    cdi -..->|"7 read device directives"| ctrd
+    ctrd --->|"8 inject /dev/nvidia0"| dev
+    ctrd --->|"9 set kernel cgroup filter"| cg
+    dev ---> app
+    cg ---> app
 
     classDef cp fill:#e7e6fb,stroke:#6b6be0,color:#20233a
     classDef dp fill:#cdeee7,stroke:#12a594,color:#10302b
     classDef star fill:#ffe6a7,stroke:#d99a1c,stroke-width:2px,color:#3a2c07
     classDef store fill:#e6e9ef,stroke:#5b6472,color:#20233a
-```
 
 ---
 

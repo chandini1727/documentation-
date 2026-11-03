@@ -164,53 +164,87 @@ To ensure anyone reviewing this architecture can clearly trace **where each comp
 
 ## Flow 1: Request Ingestion, Admission & Blueprint Assembly
 
-When a user initiates runtime creation, the request enters the **Platform Control Plane (CP)** via the unified Public API Gateway. The Control Plane authenticates the user, verifies compute quotas and price plans, locks a 5-minute capacity hold in the inventory database, and submits the custom resource blueprint to the Workload Cluster.
+When a user initiates the creation of an AIRuntime instance via the Web Console or CLI, the request is ingested and verified by the **Control Plane (CP)** before being dispatched to the target **Data Plane (DP / Regional Workload Cluster)** where the physical GPUs and storage reside.
 
-### Flow Details:
+### Detailed Flow Steps
 
-1. **Client Request:** A client (Browser Console or Neev CLI) sends `POST /api/v1beta1/orgs/{org_id}/projects/{project_id}/airuntimes`. This hits the **public-api-gateway** (`api.ai.neevcloud.com`) in the Control Plane.
-2. **Gateway Route:** The gateway matches the `/airuntimes` path prefix and routes the call to **airuntime-service** in namespace `neevai-system`.
-3. **Template & Plan Verification:** `airuntime-service` queries **PostgreSQL** (`s.queries.GetAIRuntimeTemplate`) to resolve the container image, Jupyter ports, verify user quotas, and ensure the billing `planId` matches the hardware spec.
-4. **Capacity Hold:** `airuntime-service` calls **inventory-service** (`inventoryClient.ReserveResources`) to place a 5-minute temporary hold in the `resource_reservations` table to prevent race conditions on the last available GPU.
-5. **DB Insertion:** An entry is inserted into the PostgreSQL `airuntimes` table with initial state `provisioning`.
-6. **Submit Blueprint:** `airuntime-service` invokes `BuildAIRuntimeCR()` and submits the `AIRuntime` Custom Resource (`ai.neevcloud.com/v1alpha1`) to the **K8s API Server** of the Workload Cluster via `k8sClient.Create`.
-7. **Watch & Reconcile:** The **airuntime-operator** watching the Workload Cluster receives the new CR event.
-8. **Create PVC:** The operator creates the `PersistentVolumeClaim` for Ceph storage mounted at `/data/workspace`.
-9. **Create ResourceClaim:** The operator creates the DRA `ResourceClaim` containing the CEL expression:
+1. **Client Request:**  
+   The client (Browser Console or Neev CLI) issues a `POST /api/v1beta1/orgs/{org_id}/projects/{project_id}/airuntimes` request specifying runtime name, template ID (e.g., PyTorch), GPU model SKU, GPU count, target region, pricing plan ID, and optional persistent storage size.
 
-   `device.attributes['gpu.nvidia.com'].productName == 'NVIDIA GeForce RTX 5090' && device.capacity['gpu.nvidia.com'].memory >= 31Gi`
+2. **Ingress Forwarding:**  
+   The request hits **`public-api-gateway`** (`api.ai.neevcloud.com`) in the Control Plane. The gateway terminates TLS, validates the JWT Bearer token, and routes the request to **`airuntime-service`** in namespace `neevai-system`.
 
-10. **Create Pod Object:** The operator creates the Pod in **`Pending`** state referencing the PVC and `ResourceClaim`.
+3. **Template & Quota Lookup:**  
+   `airuntime-service` queries the central **PostgreSQL DB** (`s.queries.GetAIRuntimeTemplate`) to resolve the container image, default application ports (JupyterLab on port `8888`), and asserts that project compute quotas are sufficient.
+
+4. **Template Data Returned:**  
+   PostgreSQL returns the template configuration, image registry pull credentials, and confirms quota availability.
+
+5. **Reserve Capacity Hold:**  
+   `airuntime-service` makes an internal RPC call to **`inventory-service`** (`ReserveResources`) to acquire an atomic 5-minute capacity hold in the `resource_reservations` table. This prevents concurrent users from taking the last GPU before this instance is scheduled.
+
+6. **Capacity Hold Confirmed:**  
+   `inventory-service` returns the reservation ID confirming the GPU capacity is temporarily locked.
+
+7. **Database Record Creation:**  
+   `airuntime-service` inserts a new row into the PostgreSQL `airuntimes` table with initial state `provisioning` and stores the reservation ID.
+
+8. **Dispatch Blueprint to Regional Workload Cluster:**  
+   `airuntime-service` invokes `BuildAIRuntimeCR()` to assemble the `AIRuntime` Custom Resource (`ai.neevcloud.com/v1alpha1`). Using the regional Kubernetes client matching the target region (`s.k8sClients[airuntime.Region]`), it submits the CR to the **Data Plane K8s API Server**.
+
+9. **Watch Event Triggered:**  
+   The **`airuntime-operator`** running inside the regional Workload Cluster receives the new `AIRuntime` CR event through its controller watch loop.
+
+10. **Storage Setup (Conditional):**
+    - **If Persistent Storage was requested:** The operator creates a Ceph-backed **`PersistentVolumeClaim` (PVC)** mounted at `/data/workspace` so files persist across stop/start cycles.
+    - **If Persistent Storage was NOT requested:** **No PVC is created.** The operator configures an ephemeral scratch disk (`emptyDir`).
+
+11. **Create DRA GPU Request (`ResourceClaim`):**  
+    The operator creates a Kubernetes `ResourceClaim` with the CEL hardware predicate:
+
+    ```cel
+    device.attributes['gpu.nvidia.com'].productName == 'NVIDIA GeForce RTX 5090' &&
+    device.capacity['gpu.nvidia.com'].memory.compareTo(quantity('31Gi')) >= 0
+    ```
+
+12. **Create Pod (`Pending`):**  
+    The operator creates the workload Pod attaching the storage (PVC or `emptyDir`) and referencing the GPU `ResourceClaim`. The Pod is placed in **`Pending`** state, ready for the Kubernetes scheduler and DRA driver to match and attach the physical GPU in Flow 2.
+
+### Flow 1 Diagram (RFC Style)
 
 ```mermaid
 flowchart LR
-    cl["client<br/>Console UI / CLI"]
+    cl["client<br/>Console UI / Neev CLI"]:::store
 
-    subgraph CP["Control Plane - neevai-system"]
-        gw["public-api-gateway<br/>api.ai.neevcloud.com"]
-        asvc["airuntime-service<br/>JWT Auth - Quota - Plan"]
-        db[("PostgreSQL DB<br/>airuntimes - templates")]
-        inv["inventory-service<br/>ReserveResources (5-min hold)"]
+    subgraph CP [Control Plane - neevai-system]
+        gw["public-api-gateway<br/>api.ai.neevcloud.com"]:::cp
+        asvc["airuntime-service<br/>JWT Auth · Quota · CR Assembly"]:::star
+        db[("PostgreSQL DB<br/>airuntimes · templates · quotas")]:::store
+        inv["inventory-service<br/>ReserveResources (5-min GPU hold)"]:::cp
     end
 
-    subgraph WK["Workload Cluster Control Plane"]
-        k8s[("K8s API Server<br/>etcd")]
-        aop["airuntime-operator<br/>AIRuntime Controller"]
-        pvc[("PersistentVolumeClaim<br/>/data/workspace")]
-        rc[("ResourceClaim<br/>CEL: RTX 5090 >= 31Gi")]
-        pod["AIRuntime Pod<br/>State: Pending"]
+    subgraph DP [Data Plane - Regional Workload Cluster]
+        k8s[("K8s API Server<br/>etcd · regional endpoint")]:::store
+        aop["airuntime-operator<br/>AIRuntime Controller"]:::dp
+        pvc[("Storage Mount<br/>Ceph PVC (if requested)<br/>OR emptyDir (ephemeral)")]:::store
+        rc[("ResourceClaim<br/>DRA CEL: RTX 5090 >= 31Gi")]:::store
+        pod["AIRuntime Pod<br/>State: Pending (awaiting GPU bind)"]:::dp
     end
 
-    cl -->|"1 POST /airuntimes"| gw
-    gw -->|"2 forward"| asvc
-    asvc -->|"3 resolve template & quota"| db
-    asvc -->|"4 reserve GPU"| inv
-    asvc -->|"5 insert (provisioning)"| db
-    asvc -->|"6 create AIRuntime CR"| k8s
-    k8s -->|"7 watch CR"| aop
-    aop -->|"8 create PVC"| pvc
-    aop -->|"9 create claim"| rc
-    aop -->|"10 create Pod (Pending)"| pod
+    cl --->|"1 POST /airuntimes"| gw
+    gw --->|"2 forward request"| asvc
+    asvc --->|"3 lookup template & quota"| db
+    db -..->|"4 template data & quota OK"| asvc
+    asvc --->|"5 reserve capacity hold"| inv
+    inv -..->|"6 5-min hold confirmed"| asvc
+    asvc --->|"7 insert row (provisioning)"| db
+    asvc --->|"8 dispatch AIRuntime CR"| k8s
+    k8s --->|"9 watch event"| aop
+    aop --->|"10 setup storage (PVC or emptyDir)"| pvc
+    aop --->|"11 create GPU claim"| rc
+    aop --->|"12 create Pod (Pending)"| pod
+    pvc -..->|"storage attached"| pod
+    rc -..->|"claim attached"| pod
 
     classDef cp fill:#e7e6fb,stroke:#6b6be0,color:#20233a
     classDef dp fill:#cdeee7,stroke:#12a594,color:#10302b

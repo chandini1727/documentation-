@@ -387,37 +387,73 @@ jupyter lab --ip 0.0.0.0 --port 8888
 ## Flow 2 Diagram (RFC Style)
 
 ```mermaid
+
 flowchart LR
-    subgraph CP [Cluster Control Plane]
-        rc[("ResourceClaim<br/>(RTX 5090 >= 31Gi)")]:::store
-        rs[("ResourceSlice<br/>(Node GPU Catalog)")]:::store
-        sched["kube-scheduler<br/>(DRA Plugin)"]:::cp
+    pod["AIRuntime Pod<br/>Operator Created<br/>State: Pending"]:::star
+
+    subgraph CP["Cluster Control Plane"]
+        direction TB
+        rc[("ResourceClaim<br/>RTX 5090 >= 31Gi")]:::store
+        rs[("ResourceSlice<br/>Node GPU Catalog")]:::store
+        sched["kube-scheduler<br/>DRA Plugin<br/>CEL Evaluation"]:::cp
     end
 
-    subgraph DP [GPU Worker Node — worker-3]
-        klet["kubelet Agent"]:::dp
-        dra["NVIDIA DRA Driver<br/>DaemonSet (UNIX socket)"]:::star
-        cdi[("CDI JSON Spec<br/>/var/run/cdi/...")]:::store
-        ctrd["containerd Runtime"]:::dp
-        dev["Gate 1: Isolated /dev<br/>/dev/nvidia0, uvm, ctl"]:::dp
-        cg["Gate 2: Cgroups v2<br/>Allow: gpu-0 ONLY"]:::dp
-        app["AIRuntime Pod<br/>JupyterLab :8888 (Running)"]:::dp
+    subgraph DP["GPU Worker Node - worker-3"]
+        direction TB
+
+        klet["kubelet Agent<br/>Node Supervisor"]:::dp
+
+        dra["NVIDIA DRA Driver<br/>DaemonSet<br/>UNIX Domain Socket"]:::star
+
+        cdi[("CDI JSON Specification<br/>/var/run/cdi/<br/>nvidia.com-gpu.json")]:::store
+
+        ctrd["containerd<br/>CRI Runtime"]:::dp
+
+        subgraph ISO["GPU Security and Isolation"]
+            direction TB
+            dev["Gate 1: Device Node Injection<br/>/dev/nvidia0<br/>/dev/nvidiactl<br/>/dev/nvidia-uvm<br/>/dev/nvidia-uvm-tools<br/>libcuda.so.1"]:::security
+
+            cg["Gate 2: Cgroups v2<br/>eBPF Device Filtering<br/>Allow gpu-0 ONLY"]:::security
+        end
+
+        storage[("Storage Mount<br/>/data/workspace<br/>Ceph PVC / emptyDir")]:::store
+
+        app["AIRuntime Pod<br/>JupyterLab :8888<br/>State: Running"]:::success
     end
 
-    rc --->|"1 read claim"| sched
-    rs -..->|"2 evaluate CEL catalog"| sched
-    sched --->|"3 lock gpu-0 & bind Pod"| klet
-    klet --->|"4 NodePrepareResources"| dra
-    dra --->|"5 wipe VRAM & generate spec"| cdi
-    klet --->|"6 create container"| ctrd
-    cdi -..->|"7 read device directives"| ctrd
-    ctrd --->|"8 inject /dev/nvidia0"| dev
-    ctrd --->|"9 set kernel cgroup filter"| cg
-    dev ---> app
-    cg ---> app
+    pod -->|"1. Pod created with GPU Claim"| rc
+
+    rc -->|"2. Scheduler reads claim"| sched
+
+    rs -.->|"3. Match GPU Inventory<br/>RTX 5090 >= 31Gi"| sched
+
+    sched -->|"4. Allocate gpu-0<br/>on worker-3 and bind Pod"| klet
+
+    klet -->|"5. NodePrepareResources<br/>gRPC call"| dra
+
+    dra -.->|"6. Validate GPU, clear VRAM<br/>Generate CDI JSON"| cdi
+
+    klet -->|"7. Create Container"| ctrd
+
+    cdi -.->|"8. Read CDI Instructions"| ctrd
+
+    ctrd -->|"9. Inject allocated GPU devices"| dev
+
+    ctrd -->|"10. Configure device access filter"| cg
+
+    ctrd -->|"11. Mount persistent storage"| storage
+
+    dev -->|"12. GPU device ready"| app
+
+    cg -->|"13. Security enforced"| app
+
+    storage -->|"14. Workspace mounted"| app
 
     classDef cp fill:#e7e6fb,stroke:#6b6be0,color:#20233a
     classDef dp fill:#cdeee7,stroke:#12a594,color:#10302b
     classDef star fill:#ffe6a7,stroke:#d99a1c,stroke-width:2px,color:#3a2c07
     classDef store fill:#e6e9ef,stroke:#5b6472,color:#20233a
+    classDef security fill:#fce4d6,stroke:#d97736,color:#542b12
+    classDef success fill:#d5f5df,stroke:#239653,stroke-width:2px,color:#123d25
+
 ```

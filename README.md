@@ -126,61 +126,67 @@ Inside the operator pod, two components handle the work:
 flowchart LR
     %% 1. CLIENT & GATEWAY
     cl["client<br/>Console UI / Neev CLI"]:::store
-    gw["public-api-gateway<br/>(TLS Termination & Routing)"]:::cp
+    gw["public-api-gateway<br/>api.ai.neevcloud.com"]:::cp
 
     %% 2. CONTROL PLANE SERVICES
     subgraph CP [Control Plane - neevai-system]
-        asvc["airuntime-service<br/>JWT/OPA | Validation | CR Assembly"]:::star
+        asvc["airuntime-service<br/>JWT Auth | Quota | CR Assembly"]:::star
         db[("PostgreSQL DB<br/>airuntimes | templates | quotas")]:::store
         inv["inventory-service<br/>(5-min GPU Capacity Hold)"]:::cp
         bill["billing-service<br/>(ValidateFunds: 1h credit)"]:::cp
     end
 
-    %% 3. KUBERNETES DATA PLANE
-    subgraph DP [Data Plane - Regional Workload Cluster]
-        k8s[("K8s API Server<br/>etcd | regional endpoint")]:::store
-
-        subgraph OP [airuntime-operator]
-            actrl["airuntime-controller<br/>(Watcher / Informer)"]:::dp
-            arec["AIRuntimeReconciler<br/>(Worker)"]:::dp
-        end
-
-        pvc[("Ceph Storage PVC<br/>/data/workspace")]:::store
-        rc[("ResourceClaim<br/>DRA CEL: RTX 5090 >= 31Gi")]:::store
-        rs[("ResourceSlice<br/>Worker-3 GPU Catalog")]:::store
-        sched["kube-scheduler<br/>(DRA Plugin)"]:::star
-        pod["AIRuntime Pod<br/>State: Pending (nodeName: '')"]:::dp
+    %% 3. OPERATOR INTERNALS
+    subgraph OP [airuntime-operator]
+        actrl["airuntime-controller<br/>(Watcher / Informer)"]:::dp
+        arec["AIRuntimeReconciler<br/>(Worker)"]:::dp
     end
 
-    %% STEP 1: API REQUEST TO CR CREATION
+    %% 4. KUBERNETES API SERVER (CLUSTER STATE STORE)
+    subgraph K8S [Regional K8s API Server & etcd]
+        cr_airuntime[("AIRuntime CR<br/>Status: Deploying")]:::k8s
+        pvc[("Ceph Storage PVC<br/>State: Bound")]:::store
+        rc[("ResourceClaim<br/>DRA CEL: RTX 5090 >= 31Gi")]:::k8s
+        pod[("AIRuntime Pod<br/>State: Pending | nodeName: ''")]:::k8s
+        rs[("ResourceSlice<br/>Node GPU Catalog")]:::store
+    end
+
+    %% 5. SCHEDULER
+    sched["kube-scheduler<br/>(DRA Scheduling Plugin)"]:::star
+
+    %% STEP 1: API REQUEST TO CR POSTING
     cl --->|"1 POST /airuntimes"| gw
     gw --->|"2 forward request"| asvc
     asvc --->|"3 lookup template & quota"| db
     asvc --->|"4 reserve 5-min GPU hold"| inv
     asvc --->|"5 validate funds"| bill
     asvc --->|"6 insert DB row (pending)"| db
-    asvc --->|"7 post AIRuntime CR"| k8s
+    asvc --->|"7 post AIRuntime CR"| cr_airuntime
 
-    %% STEP 2: OPERATOR RECONCILIATION
-    k8s --->|"8 watch event"| actrl
+    %% STEP 2: OPERATOR WATCH & RECONCILIATION
+    cr_airuntime --->|"8 watch event"| actrl
     actrl --->|"9 enqueue & trigger"| arec
-    arec --->|"10 update Phase='Deploying'"| k8s
-    arec --->|"11 verify storage exists & bound"| pvc
-    arec --->|"12 create ResourceClaim (CEL rule)"| rc
-    arec --->|"13 create Pod (Pending, nodeName='')"| pod
-    pvc -..->|"storage attached"| pod
-    rc -..->|"claim attached"| pod
+    arec --->|"10 update Phase='Deploying'"| cr_airuntime
+    arec --->|"11 verify storage is bound"| pvc
 
-    %% STEP 3: KUBE-SCHEDULER DRA MATCHING & BINDING
-    rc -.->|"14 read claim CEL rule"| sched
-    rs -.->|"check available RTX 5090"| sched
-    sched --->|"15 lock gpu-0 & bind nodeName='worker-3'"| pod
+    %% STEP 3: RECONCILER POSTS RESOURCECLAIM & POD TO API SERVER
+    arec --->|"12 create & post ResourceClaim"| rc
+    arec --->|"13 create & post Pod (with Claim & PVC attached, nodeName='')"| pod
+    rc -..->|"claim referenced in pod spec"| pod
+    pvc -..->|"mounted to /data/workspace"| pod
 
-    %% CLASS STYLES (Matching your document)
+    %% STEP 4: KUBE-SCHEDULER DETECTS POD & EVALUATES CLAIM
+    pod --->|"14 detect Pending Pod"| sched
+    rc -.->|"read claim CEL rules"| sched
+    rs -.->|"match available RTX 5090"| sched
+    sched --->|"15 lock gpu-0 & write nodeName='worker-3'"| pod
+
+    %% STYLING
     classDef cp fill:#e7e6fb,stroke:#6b6be0,color:#20233a
     classDef dp fill:#cdeee7,stroke:#12a594,color:#10302b
     classDef star fill:#ffe6a7,stroke:#d99a1c,stroke-width:2px,color:#3a2c07
     classDef store fill:#e6e9ef,stroke:#5b6472,color:#20233a
+    classDef k8s fill:#e6e9ef,stroke:#3b82f6,stroke-width:2px,color:#1e3a8a
 ```
 
 ---

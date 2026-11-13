@@ -135,7 +135,7 @@ flowchart LR
     end
 
     subgraph DP [Data Plane - Regional Workload Cluster]
-        k8s[("K8s API Server<br/>etcd | regional endpoint")]:::store
+        k8s[("K8s API Server<br/>Stores: CR, Claims, Pods, Slices")]:::store
         
         subgraph OP [airuntime-operator]
             actrl["airuntime-controller<br/>(Watcher)"]:::dp
@@ -162,15 +162,22 @@ flowchart LR
     k8s --->|"9 watch event"| actrl
     actrl --->|"10 trigger reconcile"| arec
     arec --->|"11 verify storage ready"| pvc
-    arec --->|"12 create GPU claim in API server"| rc
-    arec --->|"13 create Pod (Pending, nodeName='')"| pod
+
+    %% EXACT STEP: Reconciler posts generated resources to K8s API Server
+    arec --->|"12 generate & POST ResourceClaim"| k8s
+    k8s -..->|"persists claim"| rc
+
+    arec --->|"13 generate & POST Pod (nodeName='')"| k8s
+    k8s -..->|"persists pending pod"| pod
+
     pvc -..->|"storage attached"| pod
     rc -..->|"claim attached"| pod
 
-    %% Scheduler Step at the end
+    %% Scheduler reads from API Server & binds
     rc -.->|"14 reads claim"| sched
     rs -.->|"matches GPU"| sched
-    sched --->|"15 bind: set nodeName='worker-3'"| pod
+    sched --->|"15 write to API Server: bind nodeName='worker-3'"| k8s
+    k8s -.->|"updates pod"| pod
 
     classDef cp fill:#e7e6fb,stroke:#6b6be0,color:#20233a
     classDef dp fill:#cdeee7,stroke:#12a594,color:#10302b

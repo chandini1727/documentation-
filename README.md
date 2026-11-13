@@ -124,38 +124,59 @@ Inside the operator pod, two components handle the work:
 
 ```mermaid
 flowchart LR
+    %% 1. CLIENT & GATEWAY
     cl["client<br/>Console UI / Neev CLI"]:::store
+    gw["public-api-gateway<br/>(TLS Termination & Routing)"]:::cp
 
+    %% 2. CONTROL PLANE SERVICES
     subgraph CP [Control Plane - neevai-system]
-        gw["public-api-gateway<br/>api.ai.neevcloud.com"]:::cp
-        asvc["airuntime-service<br/>JWT Auth | Quota | CR Assembly"]:::star
+        asvc["airuntime-service<br/>JWT/OPA | Validation | CR Assembly"]:::star
         db[("PostgreSQL DB<br/>airuntimes | templates | quotas")]:::store
-        inv["inventory-service<br/>ReserveResources (5-min GPU hold)"]:::cp
+        inv["inventory-service<br/>(5-min GPU Capacity Hold)"]:::cp
+        bill["billing-service<br/>(ValidateFunds: 1h credit)"]:::cp
     end
 
+    %% 3. KUBERNETES DATA PLANE
     subgraph DP [Data Plane - Regional Workload Cluster]
         k8s[("K8s API Server<br/>etcd | regional endpoint")]:::store
-        aop["airuntime-operator<br/>AIRuntime Controller"]:::dp
-        pvc[("Ceph Storage PVC<br/>(via storage-service)")]:::store
+
+        subgraph OP [airuntime-operator]
+            actrl["airuntime-controller<br/>(Watcher / Informer)"]:::dp
+            arec["AIRuntimeReconciler<br/>(Worker)"]:::dp
+        end
+
+        pvc[("Ceph Storage PVC<br/>/data/workspace")]:::store
         rc[("ResourceClaim<br/>DRA CEL: RTX 5090 >= 31Gi")]:::store
-        pod["AIRuntime Pod<br/>State: Pending (awaiting GPU bind)"]:::dp
+        rs[("ResourceSlice<br/>Worker-3 GPU Catalog")]:::store
+        sched["kube-scheduler<br/>(DRA Plugin)"]:::star
+        pod["AIRuntime Pod<br/>State: Pending (nodeName: '')"]:::dp
     end
 
+    %% STEP 1: API REQUEST TO CR CREATION
     cl --->|"1 POST /airuntimes"| gw
     gw --->|"2 forward request"| asvc
     asvc --->|"3 lookup template & quota"| db
-    db -..->|"4 template data & quota OK"| asvc
-    asvc --->|"5 reserve capacity hold"| inv
-    inv -..->|"6 5-min hold confirmed"| asvc
-    asvc --->|"7 insert row (provisioning)"| db
-    asvc --->|"8 dispatch AIRuntime CR"| k8s
-    k8s --->|"9 watch event"| aop
-    aop --->|"10 verify storage ready"| pvc
-    aop --->|"11 create GPU claim"| rc
-    aop --->|"12 create Pod (Pending)"| pod
+    asvc --->|"4 reserve 5-min GPU hold"| inv
+    asvc --->|"5 validate funds"| bill
+    asvc --->|"6 insert DB row (pending)"| db
+    asvc --->|"7 post AIRuntime CR"| k8s
+
+    %% STEP 2: OPERATOR RECONCILIATION
+    k8s --->|"8 watch event"| actrl
+    actrl --->|"9 enqueue & trigger"| arec
+    arec --->|"10 update Phase='Deploying'"| k8s
+    arec --->|"11 verify storage exists & bound"| pvc
+    arec --->|"12 create ResourceClaim (CEL rule)"| rc
+    arec --->|"13 create Pod (Pending, nodeName='')"| pod
     pvc -..->|"storage attached"| pod
     rc -..->|"claim attached"| pod
 
+    %% STEP 3: KUBE-SCHEDULER DRA MATCHING & BINDING
+    rc -.->|"14 read claim CEL rule"| sched
+    rs -.->|"check available RTX 5090"| sched
+    sched --->|"15 lock gpu-0 & bind nodeName='worker-3'"| pod
+
+    %% CLASS STYLES (Matching your document)
     classDef cp fill:#e7e6fb,stroke:#6b6be0,color:#20233a
     classDef dp fill:#cdeee7,stroke:#12a594,color:#10302b
     classDef star fill:#ffe6a7,stroke:#d99a1c,stroke-width:2px,color:#3a2c07

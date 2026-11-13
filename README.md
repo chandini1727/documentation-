@@ -1,339 +1,392 @@
-# GPU Checkpoint and Restore Master Benchmarking Suite: gVisor & Reconciler Performance
+# Dynamic Resource Allocation (DRA) & AIRuntime Architecture Specification
 
-**Date:** November 13, 2026  
-**Environment:** Staging Workload Cluster  
-**Worker Nodes:** `stg-nc-workload1-worker-3` (NVIDIA RTX 5090 32GB) / `stg-nc-workload1-worker-gpu80` (NVIDIA A100/H100 80GB)  
-**Runtime Class:** `runsc-root-self` (`overlay2 = "root:self"`)  
-**Reconciler:** `sandbox-sr-operator` (`sandbox.neevcloud.com/v1alpha1`)  
-**Restore Gate:** `checkpoint-csi-driver` (`checkpoint.csi.neev.io`)  
+## Definition of DRA (Dynamic Resource Allocation)
 
----
+**Dynamic Resource Allocation (DRA)** is a Kubernetes feature that allows applications to request GPUs by specifying their exact hardware requirements—such as GPU model name and VRAM memory size—instead of just asking for a simple number like `"1 GPU"`.
 
-## 1. Overview & Benchmark Scope
+In traditional Kubernetes GPU allocation, GPUs were requested using a simple resource count, such as `nvidia.com/gpu: 1`. Kubernetes knew how many GPUs were requested but did not provide detailed device-level information through this resource request, such as the GPU model, VRAM capacity, or PCIe address.
 
-This document provides a comprehensive, multi-dimensional benchmarking evaluation of GPU checkpoint and restore under gVisor. Rather than measuring a single synthetic metric, the benchmark suite evaluates platform behavior across **five operational dimensions**:
-
-1. **VRAM Scaling Matrix (1 GB, 8 GB, 24 GB, 80 GB):** Artifact size (`status.sizeBytes`), capture duration, and CSI restore latency.
-2. **Runtime Overhead (`runc` vs. `runsc-root-self`):** Computational performance degradation caused by gVisor `nvproxy` ioctl interception.
-3. **Cold Start vs. Checkpoint Warm-Start:** End-to-end latency reduction for real-world AI models.
-4. **Concurrency & Host Contention (Thundering Herd):** Scalability when executing 1x, 2x, 4x, and 8x simultaneous snapshot/restore operations.
-5. **Multi-Cycle Stability & Memory Drift:** Verification of zero VRAM leakage and execution jitter over 10 consecutive pause/resume cycles.
+With Dynamic Resource Allocation (DRA), each physical GPU is represented as an individual device. This allows Kubernetes to identify and manage GPUs separately, along with their device information, such as GPU model, VRAM capacity, PCIe address, and health status.
 
 ---
 
-## 2. Benchmark 1: VRAM Memory Scaling (1 GB, 8 GB, 24 GB, 80 GB)
+## How AIRuntime Works with DRA: Step-by-Step Technical Execution
 
-### 2.1 Objective & Test Matrix
-Evaluates how checkpoint image sizes, compression ratios, capture times, and restore times scale as active GPU memory utilization increases from lightweight embedders to enterprise LLMs.
+The complete lifecycle of an AIRuntime from API call to active GPU execution follows these 7 distinct steps:
 
-| VRAM Tier | Representative Workload | Host RAM Limit | Raw Image Size | S3 Image Size (`status.sizeBytes`) | Capture Time (`SnapshotJob`) | CSI Restore Time (`checkpoint.csi`) | Status |
-|:---:|---|:---:|:---:|:---:|:---:|:---:|:---:|
-| **1 GB** | PyTorch AdamW / Lightweight Embedder | 6 GiB | 2.82 GB | **1,052 MB** (~1.03 GB) | **8.24 s** | **9.12 s** | **PASSED** |
-| **8 GB** | ComfyUI SD-1.5 / LoRA Pipeline | 16 GiB | 12.35 GB | **2,508 MB** (~2.45 GB) | **15.60 s** | **16.85 s** | **PASSED** |
-| **24 GB** | vLLM 7B-FP16 / RTX 5090 Max | 32 GiB | 39.80 GB | **3,891 MB** (~3.80 GB) | **22.40 s** | **26.00 s** | **PASSED** |
-| **80 GB** | A100/H100 Dense LLM (Llama-3-70B 4-bit)| 96 GiB | 126.50 GB | **14,540 MB** (~14.20 GB)| **58.50 s** | **64.20 s** | **VALIDATED** |
+### Step 1: From User API Request to Kubernetes CR Creation (`airuntime-service`)
 
-### 2.2 Phase-by-Phase Timing Breakdown
+This step covers everything that happens from the moment a user clicks **"Create"** in the UI until the workload blueprint (the `AIRuntime` Custom Resource) is created and handed over to Kubernetes:
 
-#### Capture Phase (`SnapshotJob` Execution):
-$$\text{T}_{\text{capture}} = \text{T}_{\text{reconcile\_hook}} + \text{T}_{\text{runsc\_dump}} + \text{T}_{\text{compress}} + \text{T}_{\text{s3\_put}}$$
+1. **User Action & API Submission:**  
+   The user chooses their GPU (e.g., RTX 5090), software template (e.g., PyTorch), region, and storage in the UI, then clicks **Create**. The UI sends an HTTP request:  
+   `POST /api/v1beta1/orgs/{org_id}/projects/{project_id}/airuntimes`
 
-| VRAM Tier | Reconciler Hook | Memory Dump (`runsc`) | `tar + zstd -3` (500m / Multi) | S3 Upload (10G RGW) | Total Capture Duration |
-|:---:|:---:|:---:|:---:|:---:|:---:|
-| **1 GB**  | 0.45 s | 3.80 s | 2.10 s / 0.45 s | 1.89 s | **8.24 s** |
-| **8 GB**  | 0.52 s | 6.88 s | 5.10 s / 1.40 s | 3.10 s | **15.60 s** |
-| **24 GB** | 0.50 s | 11.20 s | 6.80 s / 3.80 s | 3.90 s | **22.40 s** |
-| **80 GB** | 0.65 s | 30.15 s | 19.50 s / 11.20 s | 8.20 s | **58.50 s** |
+2. **Gateway Forwarding (TLS Termination & Routing):**  
+   The request hits **`public-api-gateway`** (Istio Ingress Gateway at `api.ai.neevcloud.com`).  
+   - The gateway decrypts HTTPS (TLS termination).  
+   - It does **not** authenticate the user. It acts as an L7 reverse proxy, forwarding the raw HTTP request and `Authorization: Bearer <token>` header directly to `airuntime-service`.
 
-#### Restore Phase (`checkpoint-csi-driver` Execution):
-$$\text{T}_{\text{restore}} = \text{T}_{\text{csi\_download}} + \text{T}_{\text{tar\_extract}} + \text{T}_{\text{runsc\_hydrate}} + \text{T}_{\text{nvproxy\_init}}$$
+3. **Authentication & Authorization (`airuntime-service`):**  
+   Inside `airuntime-service`, built-in middleware processes the request:  
+   - **JWT Validation:** Validates the signature of the Bearer token and extracts `user_id`.  
+   - **OPA Permission Check:** Queries Open Policy Agent (OPA) to confirm the user has permission to create GPU workloads in this project.
 
-| VRAM Tier | S3 Download (`NodePublishVolume`) | Zstandard Decompress | gVisor Memory Hydration | `nvproxy` CUDA Recovery | Total Restore Duration |
-|:---:|:---:|:---:|:---:|:---:|:---:|
-| **1 GB**  | 1.80 s | 1.50 s | 4.42 s | 1.40 s | **9.12 s** |
-| **8 GB**  | 3.10 s | 3.20 s | 8.35 s | 2.20 s | **16.85 s** |
-| **24 GB** | 4.20 s | 5.50 s | 13.50 s | 2.80 s | **26.00 s** |
-| **80 GB** | 9.80 s | 16.40 s | 32.00 s | 6.00 s | **64.20 s** |
+4. **Template Specification & Workload Resolution:**  
+   `airuntime-service` queries the `airuntime_templates` database table using the requested `template_id` to determine:  
+   - **Container Image:** The exact Docker image to pull and execute on the GPU (e.g., `pytorch-jupyter:v2.4`).  
+   - **Application & Port Configuration:** The interactive applications to expose and their network ports (e.g., JupyterLab on port `8888` with an auto-generated secure login password).
 
----
+5. **GPU Hardware Validation (`inventoryClient.GetGpuConfig`):**  
+   `airuntime-service` calls `inventory-service` using `gpu_config_id` to confirm physical hardware specs:  
+   - GPU Model: `NVIDIA GeForce RTX 5090`  
+   - VRAM: `32 GiB`  
+   - CPU & System RAM allocations.
 
-## 3. Benchmark 2: Runtime GPU Compute Overhead (`runc` vs. `runsc-root-self`)
+6. **Atomic 5-Minute Capacity Hold (`inventoryClient.ReserveResources`):**  
+   Before creating anything in Kubernetes, `airuntime-service` calls `inventory-service` to place a temporary **5-minute lock** on 1 physical GPU in that region.  
+   - *Why:* To immediately secure the hardware so concurrent users cannot take the last GPU.
 
-### 3.1 Objective
-Measures the runtime execution penalty introduced by gVisor's sandbox boundary and `nvproxy` intercepting CUDA driver `ioctl` commands compared to native unconfined containers (`runc`).
+7. **Wallet Balance & Billing Verification (`billingClient.ValidateFunds`):**  
+   Calls `billing-service` to ensure:  
+   - The selected billing plan matches the GPU model.  
+   - The user/organization has sufficient wallet balance (at least 1 hour of credits for on-demand usage). *(If this fails, the capacity hold is immediately released).*
 
-### 3.2 Benchmark Results Across AI Workloads
+8. **Storage Setup & Validation:**  
+   Checks the user's storage choice:  
+   - If reusing an existing volume, verifies it is in `bound` state in that region.  
+   - If requesting a new volume, calls `storage-service` to provision a Ceph network volume to be mounted at `/data/workspace`.
 
-| Workload | Evaluated Metric | Native Baseline (`runc`) | gVisor Sandbox (`runsc-root-self`) | Overhead Delta (%) | Observation |
-|---|---|:---:|:---:|:---:|---|
-| **vLLM (GPT-2 / Mistral)** | Throughput (Tokens/sec) | 124.5 tok/s | 121.8 tok/s | **-2.17%** | Negligible impact on batch token generation |
-| | Time to First Token (TTFT p50) | 38.2 ms | 40.5 ms | **+6.02%** | Driver ioctl interception on initial context load |
-| | Inter-Token Latency (ITL p50) | 8.03 ms | 8.21 ms | **+2.24%** | Fast GPU-resident kernel execution |
-| **PyTorch Training** | Step Iteration Time | 18.2 ms | 18.9 ms | **+3.84%** | Small host-to-device synchronization overhead |
-| | GEMM FP16 Compute (TFLOPS) | 148.2 TFLOPS | 146.5 TFLOPS | **-1.15%** | Raw tensor core execution runs at bare-metal speed |
-| **ComfyUI Diffusion** | Sampling Iteration Speed | 14.8 it/s | 14.5 it/s | **-2.02%** | Zero noticeable difference in generation latency |
+9. **Database Record Creation (`s.queries.CreateAIRuntime`):**  
+   Inserts a new row into the PostgreSQL `airuntimes` table with initial status **`pending`**, and generates a secure 16-character login password for JupyterLab.
 
-> **Conclusion on Runtime Penalty:**  
-> Once model weights and CUDA contexts are loaded onto the GPU, computations execute directly on physical GPU silicon without CPU kernel traps. Runtime penalty remains consistently **below 2.5%** for compute-bound operations.
+10. **Build and Post Custom Resource:**  
+    `airuntime-service` builds the custom resource and posts it to the regional Kubernetes API server.
 
 ---
 
-## 4. Benchmark 3: Cold Start vs. Checkpoint Warm-Start
+### Step 2: Operator Creates the GPU Claim and Workload Pod (`airuntime-operator`)
 
-### 4.1 Objective
-Measures the reduction in time-to-first-inference when resuming a pre-warmed snapshot versus initializing a container from scratch (pulling container image, downloading weights from Hugging Face/S3, and running CUDA memory allocation).
+`airuntime-operator` runs in GPU worker nodes. To prevent conflicts, it runs under Kubernetes **Leader Election** (`1a4350ec.ai.neevcloud.com`), ensuring only one active leader pod processes requests at a time while standby copies wait for automatic failover.
 
-### 4.2 Comparative Latency Results
-
-| Model / Workload | Cold Start Sequence (Pull + Weight Fetch + VRAM Init) | Checkpoint Warm-Start (`checkpoint-csi-driver`) | Absolute Time Saved | Speedup Factor |
-|---|:---:|:---:|:---:|:---:|
-| **BERT / Embedder (1 GB)** | 35.0 s | **9.12 s** | ~26.0 s | **3.8x faster** |
-| **ComfyUI SD-1.5 (8 GB)** | 65.0 s | **16.85 s** | ~48.0 s | **3.9x faster** |
-| **Mistral-7B / vLLM (24 GB)** | 142.0 s (2.4 min) | **26.00 s** | ~116.0 s | **5.4x faster** |
-| **Llama-3-70B Dense (80 GB)** | 480.0 s (8.0 min) | **64.20 s** | ~415.8 s | **7.5x faster** |
+Inside the operator pod, two components handle the work:
+* **`airuntime-controller` (The Watcher):** Watches the Kubernetes API server for new or updated `AIRuntime` custom resources.
+* **`AIRuntimeReconciler` (The Worker):** Takes the request and executes the actual work step-by-step.
 
 ---
 
-## 5. Benchmark 4: Concurrency & Host Contention (Thundering Herd)
+#### Step-by-Step Execution:
 
-### 5.1 Objective
-Simulates high-density multi-tenant environments where multiple GPU sandboxes trigger snapshots or restores simultaneously on the same host or storage cluster.
+1. **Catches the Request (`airuntime-controller`):**  
+   The controller sees the new `AIRuntime` Custom Resource (CR) in the API server and puts it into the work queue.
 
-### 5.2 Concurrent Snapshot Performance (Capture Contention)
+2. **Loads and Validates the CR (`AIRuntimeReconciler`):**  
+   The reconciler reads the CR into memory via `r.Get()` and confirms the GPU model, configuration ID, and Docker container image are valid.
 
-| Concurrency Level | Aggregate Raw Output | Mean Capture Time per Pod | S3 Aggregate PUT Bandwidth | Scratch NVMe Contention |
-|:---:|:---:|:---:|:---:|:---:|
-| **1x Pod (Baseline)** | 2.8 GB | **8.24 s** | 43 MB/s (Single-stream) | Nominal (~18 MB/s write) |
-| **2x Pods Parallel** | 5.6 GB | **9.80 s** | 82 MB/s | Nominal (~36 MB/s write) |
-| **4x Pods Parallel** | 11.2 GB | **14.20 s** | 145 MB/s | Noticeable compression CPU contention |
-| **8x Pods Parallel** | 22.4 GB | **23.50 s** | 198 MB/s (Link bounded) | Bounded by host CPU core allocation |
+3. **Sets Status to `Deploying`:**  
+   Updates the runtime phase to `Deploying` (`Status.Phase = "Deploying"`) so users and backend services know provisioning has started.
 
-### 5.3 Concurrent CSI Restore Performance (Restore Gate Contention)
+4. **Checks Storage (Ceph PVC):**  
+   Verifies that the Ceph storage volume (PVC) exists in the project namespace. If the volume is not ready yet, it pauses and retries in 5 seconds.
 
-| Concurrency Level | Mean Restore Latency per Pod | S3 Aggregate GET Bandwidth | Local Scratch Disk Write Rate | Gate Failure Rate |
-|:---:|:---:|:---:|:---:|:---:|
-| **1x Restore** | **9.12 s** | 115 MB/s | 98 MB/s | **0% (0/1)** |
-| **2x Restores** | **11.40 s** | 210 MB/s | 185 MB/s | **0% (0/2)** |
-| **4x Restores** | **17.80 s** | 380 MB/s | 275 MB/s (Near NVMe ceiling) | **0% (0/4)** |
-| **8x Restores** | **31.20 s** | 420 MB/s | 295 MB/s (NVMe write saturated) | **0% (0/8)** |
+5. **Creates the GPU Claim (`ResourceClaim`):**  
+   The reconciler builds a DRA `ResourceClaim` specifying the required GPU model and VRAM using a CEL rule, sets the `AIRuntime` CR as its owner, and posts it to the Kubernetes API server:
 
----
+   ```cel
+   device.attributes['gpu.nvidia.com'].productName == 'NVIDIA GeForce RTX 5090' &&
+   device.capacity['gpu.nvidia.com'].memory.compareTo(quantity('31Gi')) >= 0
+   ```
 
-## 6. Benchmark 5: Multi-Cycle Stability & Memory Leakage
-
-### 6.1 Objective
-Validates whether repeated pause-and-resume cycles lead to VRAM fragmentation, host RAM degradation, or performance drift over extended operational lifecycles.
-
-### 6.2 Test Protocol
-A 24 GB GPU workload was subjected to **10 consecutive cycles**:
-$$\text{Workload Active} \longrightarrow \text{SnapshotJob} \longrightarrow \text{Pod Deletion (0MB VRAM)} \longrightarrow \text{CSI Restore} \longrightarrow \text{Inference Verification}$$
-
-### 6.3 Cycle Stability Data (10 Consecutive Iterations)
-
-| Cycle # | VRAM Pre-Snapshot | Snapshot Duration | S3 Size (`sizeBytes`) | Restore Duration | VRAM Post-Restore | Residual Leak |
-|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
-| **1** | 24,576.0 MB | 22.40 s | 3,891,244,112 B | 26.00 s | 24,576.0 MB | **0.0 MB** |
-| **2** | 24,576.0 MB | 22.15 s | 3,891,244,112 B | 25.80 s | 24,576.0 MB | **0.0 MB** |
-| **3** | 24,576.0 MB | 22.80 s | 3,891,248,208 B | 26.40 s | 24,576.0 MB | **0.0 MB** |
-| **4** | 24,576.0 MB | 22.30 s | 3,891,244,112 B | 25.90 s | 24,576.0 MB | **0.0 MB** |
-| **5** | 24,576.0 MB | 22.60 s | 3,891,244,112 B | 26.10 s | 24,576.0 MB | **0.0 MB** |
-| **6** | 24,576.0 MB | 22.45 s | 3,891,252,304 B | 26.05 s | 24,576.0 MB | **0.0 MB** |
-| **7** | 24,576.0 MB | 22.20 s | 3,891,244,112 B | 25.75 s | 24,576.0 MB | **0.0 MB** |
-| **8** | 24,576.0 MB | 22.90 s | 3,891,244,112 B | 26.30 s | 24,576.0 MB | **0.0 MB** |
-| **9** | 24,576.0 MB | 22.50 s | 3,891,244,112 B | 25.95 s | 24,576.0 MB | **0.0 MB** |
-| **10** | 24,576.0 MB | 22.35 s | 3,891,244,112 B | 26.00 s | 24,576.0 MB | **0.0 MB** |
-
-### 6.4 Statistical Jitter Analysis
-- **Capture Latency ($T_{\text{capture}}$):** Mean = **22.46 s**, Standard Deviation = **0.23 s** ($p99 = 22.90\text{ s}$)
-- **Restore Latency ($T_{\text{restore}}$):** Mean = **26.02 s**, Standard Deviation = **0.20 s** ($p99 = 26.40\text{ s}$)
-- **VRAM Leakage:** **Zero bytes** leaked across all 10 cycles. Full physical GPU memory is completely released upon pod termination and cleanly remapped upon restore.
+6. **Creates the Pod Spec and Adds the ResourceClaim:**  
+   The reconciler builds the Pod specification and attaches the GPU `ResourceClaim` to it:
+   - Sets the container image (e.g., PyTorch + JupyterLab).
+   - Mounts the Ceph storage volume at `/data/workspace`.
+   - Adds the GPU `ResourceClaim` under `pod.spec.resourceClaims`.
+   - Injects the JupyterLab login password.
+   - Leaves `nodeName` empty (`""`) so the scheduler can pick the physical node.
+   - Sends the Pod specification to the Kubernetes API server.
 
 ---
 
-## 7. Reconciler Manifest Specifications
+### Step 3: Scheduler Matches the Workload to a GPU Node (`kube-scheduler`)
 
-### 7.1 Workload Pod Specification (`pod-bench.yaml`)
+1. **GPU Catalogs on the Master Node (`ResourceSlice`):**  
+   Every GPU worker node registers its physical cards with the **Master Node** (API Server). The Master Node stores these `ResourceSlice` catalogs listing all available GPUs across the cluster.
 
-```yaml
-apiVersion: v1
-kind: Pod
-metadata:
-  name: airuntime-gpu-bench
-  namespace: gpu-gvisor-poc
-  annotations:
-    dev.gvisor.spec.mount.workspace.type: bind
-    dev.gvisor.spec.mount.workspace.share: pod
-    dev.gvisor.spec.mount.workspace.options: size=1073741824
-spec:
-  runtimeClassName: runsc-root-self
-  restartPolicy: Never
-  nodeSelector:
-    kubernetes.io/hostname: stg-nc-workload1-worker-3
-  resourceClaims:
-  - name: gpu
-    resourceClaimName: gpu-claim
-  volumes:
-  - name: workspace
-    emptyDir: {}
-  - name: cuda-checkpoint
-    hostPath:
-      path: /opt/cuda-checkpoint
-      type: Directory
-  - name: ckpt-gate
-    csi:
-      driver: checkpoint.csi.neev.io
-  containers:
-  - name: cuda
-    image: harbor.neev.work/test-template/pytorch-v2.8.0-ubuntu-24.04:0.1.2
-    command:
-    - /bin/bash
-    - -c
-    - |
-      export PATH=/opt/venv/bin:$PATH
-      cat << 'PYEOF' > /workspace/vram_server.py
-      import http.server, urllib.parse, json, time, os, torch
+2. **Scheduler Checks the Master Node Catalog:**  
+   Running on the Master Node, **`kube-scheduler`** inspects the `ResourceSlice` records to find a worker node with a free RTX 5090.
 
-      target_gib = float(os.getenv("TARGET_VRAM_GIB", "1.0"))
-      elements = int((target_gib * 1024**3) / 4)
-      tensor = torch.zeros(elements, dtype=torch.float32, device="cuda:0")
-      torch.cuda.synchronize()
+3. **Locks the GPU and Binds to the Worker Node:**  
+   The scheduler locks the chosen GPU (e.g., `gpu-0` on `worker-3`) and assigns the workload to that worker node (`pod.spec.nodeName = "worker-3"`).
 
-      tick = 0
-      class BenchHandler(http.server.BaseHTTPRequestHandler):
-          def do_GET(self):
-              global tick
-              if self.path == "/health":
-                  tick += 1
-                  tensor[0] = float(tick)
-                  self.send_response(200)
-                  self.send_header("Content-Type", "application/json")
-                  self.end_headers()
-                  data = {
-                      "status": "healthy",
-                      "gpu": torch.cuda.get_device_name(0),
-                      "vram_allocated_mb": round(torch.cuda.memory_allocated(0) / (1024 * 1024), 1),
-                      "active_tick": int(tensor[0].item())
-                  }
-                  self.wfile.write(json.dumps(data, indent=2).encode())
-                  return
-              self.send_response(404)
-              self.end_headers()
+4. **Handoff to the Worker Node:**  
+   The Master Node dispatches the assignment to `worker-3`, and that worker node takes over to prepare the hardware and launch the GPU Pod (Step 4).
 
-      server = http.server.ThreadingHTTPServer(("0.0.0.0", 8000), BenchHandler)
-      server.serve_forever()
-      PYEOF
-      exec /opt/venv/bin/python3 -u /workspace/vram_server.py
-    env:
-    - name: TARGET_VRAM_GIB
-      value: "1.0"
-    - name: NVIDIA_VISIBLE_DEVICES
-      value: void
-    volumeMounts:
-    - name: workspace
-      mountPath: /workspace
-    - name: cuda-checkpoint
-      mountPath: /opt/cuda-checkpoint
-      readOnly: true
-    - name: ckpt-gate
-      mountPath: /var/run/neev-checkpoint-gate
-      readOnly: true
-    resources:
-      requests:
-        cpu: "2"
-        memory: "6Gi"
-      limits:
-        cpu: "2"
-        memory: "6Gi"
-      claims:
-      - name: gpu
+```mermaid
+flowchart LR
+    %% -------------------------------------------------------------
+    %% 1. CLIENT
+    %% -------------------------------------------------------------
+    subgraph CLIENT_TIER [External]
+        cl["client<br/>(Console UI / Neev CLI)"]:::store
+    end
+
+    %% -------------------------------------------------------------
+    %% 2. MANAGEMENT CLUSTER
+    %% -------------------------------------------------------------
+    subgraph MGMT [MANAGEMENT CLUSTER - Central Control Plane]
+        subgraph MGMT_WORKERS [Worker Nodes - Ingress & System Pool]
+            gw["public-api-gateway"]:::cp
+            asvc["airuntime-service"]:::star
+            inv["inventory-service"]:::cp
+            bill["billing-service"]:::cp
+            db[("PostgreSQL DB")]:::store
+        end
+    end
+
+    %% -------------------------------------------------------------
+    %% 3. REGIONAL CEPH STORAGE CLUSTER (PHYSICAL STORAGE)
+    %% -------------------------------------------------------------
+    subgraph STORAGE_TIER [REGIONAL STORAGE NETWORK]
+        ceph_cluster[("Ceph Storage Cluster<br/>(MONs / OSDs)<br/>Actual Data & Files Live Here!")]:::ceph
+    end
+
+    %% -------------------------------------------------------------
+    %% 4. WORKLOAD CLUSTER
+    %% -------------------------------------------------------------
+    subgraph WKLD [REGIONAL WORKLOAD CLUSTER - Regional Data Plane]
+
+        %% MASTER / CONTROL PLANE NODES
+        subgraph WKLD_MASTER [Master / Control-Plane Nodes]
+            subgraph K8S [Regional K8s API Server & etcd (Cluster State & Metadata Store)]
+                cr_airuntime[("AIRuntime CR<br/>Status: Deploying")]:::k8s
+                pvc[("K8s PVC Object<br/>YAML Metadata Pointer only!")]:::k8s
+                rc[("ResourceClaim<br/>DRA CEL: RTX 5090 >= 31Gi")]:::k8s
+                pod_obj[("AIRuntime Pod Spec<br/>State: Pending | nodeName: ''")]:::k8s
+                rs[("ResourceSlice<br/>Node GPU Catalog")]:::k8s
+            end
+            sched["kube-scheduler<br/>(DRA Plugin)"]:::star
+        end
+
+        %% SYSTEM WORKER NODES (NO GPU)
+        subgraph WKLD_SYS_WORKER [Worker Nodes - System Pool / Non-GPU]
+            subgraph OP [airuntime-operator]
+                actrl["airuntime-controller<br/>(Watcher / Informer)"]:::dp
+                arec["AIRuntimeReconciler<br/>(Worker)"]:::dp
+            end
+        end
+
+        %% GPU COMPUTE WORKER NODES
+        subgraph WKLD_GPU_WORKER [Worker Nodes - GPU Compute Node: worker-3]
+            running_pod["AIRuntime Container / Pod<br/>(User Workload)"]:::gpu
+            gpu_hw["Physical GPU<br/>(RTX 5090 / gpu-0)"]:::store
+            csi_driver["Ceph CSI Node Plugin<br/>(DaemonSet Driver)"]:::dp
+        end
+    end
+
+    %% =============================================================
+    %% FLOW ARROWS
+    %% =============================================================
+
+    %% API FLOW
+    cl --->|"1 POST /airuntimes"| gw
+    gw --->|"2 forward"| asvc
+    asvc --->|"3 lookup"| db
+    asvc --->|"4 reserve hold"| inv
+    asvc --->|"5 check funds"| bill
+    asvc --->|"6 insert DB (pending)"| db
+
+    %% TO WORKLOAD MASTER
+    asvc ===|"7 post AIRuntime CR"| cr_airuntime
+
+    %% OPERATOR RECONCILIATION
+    cr_airuntime --->|"8 watch"| actrl
+    actrl --->|"9 trigger"| arec
+    arec --->|"10 update Deploying"| cr_airuntime
+    arec --->|"11 verify PVC metadata is bound"| pvc
+    arec --->|"12 post ResourceClaim"| rc
+    arec --->|"13 post Pod Spec"| pod_obj
+    rc -..->|"referenced in spec"| pod_obj
+    pvc -..->|"referenced in spec"| pod_obj
+
+    %% SCHEDULING
+    pod_obj --->|"14 detect Pending"| sched
+    rc -.->|"evaluate CEL"| sched
+    rs -.->|"match GPU"| sched
+    sched --->|"15 lock gpu-0 & write nodeName='worker-3'"| pod_obj
+
+    %% EXECUTION ON WORKER-3
+    pod_obj ===|"16 Kubelet starts Pod"| running_pod
+    gpu_hw -.->|"bind GPU"| running_pod
+
+    %% CEPH PHYSICAL CONNECTION
+    csi_driver ===|"17 Mounts network block device directly into /data/workspace"| running_pod
+    csi_driver <===>|"Read / Write disk blocks over storage network"| ceph_cluster
+
+    %% =============================================================
+    %% STYLING
+    %% =============================================================
+    classDef cp fill:#e7e6fb,stroke:#6b6be0,color:#20233a
+    classDef dp fill:#cdeee7,stroke:#12a594,color:#10302b
+    classDef star fill:#ffe6a7,stroke:#d99a1c,stroke-width:2px,color:#3a2c07
+    classDef store fill:#e6e9ef,stroke:#5b6472,color:#20233a
+    classDef k8s fill:#e6e9ef,stroke:#3b82f6,stroke-width:2px,color:#1e3a8a
+    classDef gpu fill:#d1fae5,stroke:#059669,stroke-width:2px,color:#064e3b
+    classDef ceph fill:#fef3c7,stroke:#b45309,stroke-width:2px,color:#78350f
 ```
 
-### 7.2 SnapshotJob Reconciler CR (`snapshotjob-bench.yaml`)
 
-```yaml
-apiVersion: sandbox.neevcloud.com/v1alpha1
-kind: SnapshotJob
-metadata:
-  name: sj-vram-bench
-  namespace: gpu-gvisor-poc
-spec:
-  sandboxRef: airuntime-gpu-bench
-  nodeName: stg-nc-workload1-worker-3
-  mode: snapshot
-  snapshotType: full
-  runtimeClass: runsc-root-self
-```
+---
 
-### 7.3 CSI Restore Gate Pod (`restore-bench.yaml`)
+### Step 4: Node Hardware Preparation (`kubelet` & DRA Driver DaemonSet)
 
-```yaml
-apiVersion: v1
-kind: Pod
-metadata:
-  name: airuntime-gpu-bench
-  namespace: gpu-gvisor-poc
-  annotations:
-    dev.gvisor.spec.mount.workspace.type: bind
-    dev.gvisor.spec.mount.workspace.share: pod
-    dev.gvisor.spec.mount.workspace.options: size=1073741824
-    dev.gvisor.internal.restore.host-image-path: /var/lib/neev-checkpoint-scratch/gpu-gvisor-poc/sj-vram-bench/checkpoint
-spec:
-  runtimeClassName: runsc-root-self
-  restartPolicy: Never
-  nodeSelector:
-    kubernetes.io/hostname: stg-nc-workload1-worker-3
-  resourceClaims:
-  - name: gpu
-    resourceClaimName: gpu-claim
-  volumes:
-  - name: workspace
-    emptyDir: {}
-  - name: cuda-checkpoint
-    hostPath:
-      path: /opt/cuda-checkpoint
-      type: Directory
-  - name: ckpt-gate
-    csi:
-      driver: checkpoint.csi.neev.io
-      volumeAttributes:
-        restoreId: sj-vram-bench
-        objectRef: s3://sandbox-snapshots/gpu-gvisor-poc/sj-vram-bench.tar.zst
-        sha256: "${SNAPSHOT_SHA256}"
-  containers:
-  - name: cuda
-    image: harbor.neev.work/test-template/pytorch-v2.8.0-ubuntu-24.04:0.1.2
-    command:
-    - /bin/bash
-    - -c
-    - "exec /opt/venv/bin/python3 -u /workspace/vram_server.py"
-    env:
-    - name: NVIDIA_VISIBLE_DEVICES
-      value: void
-    volumeMounts:
-    - name: workspace
-      mountPath: /workspace
-    - name: cuda-checkpoint
-      mountPath: /opt/cuda-checkpoint
-      readOnly: true
-    - name: ckpt-gate
-      mountPath: /var/run/neev-checkpoint-gate
-      readOnly: true
-    resources:
-      requests:
-        cpu: "2"
-        memory: "6Gi"
-      limits:
-        cpu: "2"
-        memory: "6Gi"
-      claims:
-      - name: gpu
+Every GPU worker node in the cluster runs an **NVIDIA DRA driver DaemonSet pod** (the kubelet plugin) that directly interfaces with the node's PCIe hardware.
+
+1. **Kubelet Receives the Pod:** The `kubelet` agent on `worker-3` sees that the Pod has been assigned to its node and recognizes that it requires a DRA resource (`gpu-claim`).
+2. **Local gRPC Call (`NodePrepareResources`):** `kubelet` connects to the local **NVIDIA DRA driver DaemonSet pod** running on that same node via a local UNIX socket and executes a `NodePrepareResources` gRPC call.
+3. **Hardware Reset & CDI File Generation:**
+   - The NVIDIA DRA driver daemon on `worker-3` validates physical `gpu-0`, inspects its hardware address, and clears any leftover memory from prior workloads.
+   - The driver then writes the **CDI (Container Device Interface) JSON file** directly to the host filesystem at `/var/run/cdi/nvidia.com-gpu.json`:
+
+     ```json
+     {
+       "cdiVersion": "0.5.0",
+       "kind": "nvidia.com/gpu",
+       "devices": [
+         {
+           "name": "gpu-0",
+           "containerEdits": {
+             "deviceNodes": [
+               {"path": "/dev/nvidia0", "hostPath": "/dev/nvidia0"},
+               {"path": "/dev/nvidiactl", "hostPath": "/dev/nvidiactl"},
+               {"path": "/dev/nvidia-uvm", "hostPath": "/dev/nvidia-uvm"},
+               {"path": "/dev/nvidia-uvm-tools", "hostPath": "/dev/nvidia-uvm-tools"}
+             ],
+             "mounts": [
+               {
+                 "hostPath": "/usr/lib/x86_64-linux-gnu/libcuda.so.1",
+                 "containerPath": "/usr/lib/x86_64-linux-gnu/libcuda.so.1",
+                 "options": ["ro", "nosuid", "nodev", "bind"]
+               }
+             ]
+           }
+         }
+       ]
+     }
+     ```
+
+   - This JSON file is the concrete instruction sheet that tells `containerd` exactly which `/dev/` files to create and which driver libraries to attach to the container.
+
+---
+
+### Step 5: Container Device Attachment and Process Launch (`containerd` & CDI)
+
+The Pod is now on `worker-3`, and the NVIDIA driver has prepared the CDI instructions file. Next, `containerd` starts the container to run the user's requested workload (e.g., PyTorch + JupyterLab).
+
+By default, a container is isolated and cannot see or access the physical GPU on the host server. To connect the GPU to this container, `containerd` reads the CDI file (`/var/run/cdi/nvidia.com-gpu.json`) and unlocks the **operating system gates**:
+
+1. **Gate 1: Creating the Device Files inside the Pod's `/dev/` Directory:**
+   - In Linux, **every piece of hardware is represented as a file** inside the `/dev/` directory (for example, `/dev/sda` for a disk).
+   - By default, a Pod's container has its own private `/dev/` folder with **zero GPU files**. If PyTorch looks for a GPU, it finds nothing and throws an error: `No CUDA GPUs are available`.
+   - **Only the Requested GPU is Added (Strict Isolation):**
+     - If the host node has 8 physical GPUs (`gpu-0` through `gpu-7`) and you requested **1 GPU**, the CDI file contains **ONLY** the data for that single assigned GPU (`gpu-0`).
+     - It does **NOT** include any other GPUs on the node. The other 7 cards (`/dev/nvidia1` through `/dev/nvidia7`) do not exist inside your container and are completely invisible.
+   - `containerd` reads the CDI file and injects only the requested card's files directly into the Pod's private `/dev/` directory:
+     - **`/dev/nvidia0`**: The direct data pipeline to physical GPU 0. PyTorch writes to this file to send AI models, weights, and CUDA calculation instructions.
+     - **`/dev/nvidiactl`**: The master control switch used to initialize the card, power it up, and check temperature and clock speeds.
+     - **`/dev/nvidia-uvm`**: Unified Virtual Memory file that allows CPU RAM and GPU VRAM to share data directly.
+     - **`/dev/nvidia-uvm-tools`**: Profiling interface used by performance monitoring tools (like PyTorch Profiler).
+
+2. **Gate 2: Device Security Filter (Cgroups v2):**
+   - Even with the files in `/dev/`, the Linux kernel blocks unauthorized hardware access by default.
+   - `containerd` sets a security rule that **allows access ONLY to GPU 0** (`gpu-0`). Access to all other GPUs on the machine is strictly blocked.
+   - This ensures your container can only use its assigned card and cannot touch any other user's GPU on the server.
+
+3. **Storage Mount:**
+   - If persistent storage was requested, `containerd` mounts the Ceph PVC to `/data/workspace`.
+
+4. **Container Entrypoint Execution:**
+   - With device nodes injected, security filters set, and storage mounted, `containerd` executes the container entrypoint process:
+
+     ```bash
+     jupyter lab --ip 0.0.0.0 --port 8888
+     ```
+
+   - The Pod officially transitions from `Pending` to **`Running`**.
+
+```mermaid
+flowchart LR
+    pod["AIRuntime Pod<br/>Operator Created<br/>State: Pending"]:::star
+
+    subgraph CP["Cluster Control Plane (Master Node)"]
+        direction TB
+        rc[("ResourceClaim<br/>RTX 5090 >= 31Gi")]:::store
+        rs[("ResourceSlice<br/>Node GPU Catalog")]:::store
+        sched["kube-scheduler<br/>DRA Plugin<br/>CEL Evaluation"]:::cp
+    end
+
+    subgraph DP["GPU Worker Node - worker-3"]
+        direction TB
+
+        klet["kubelet Agent<br/>Node Supervisor"]:::dp
+
+        dra["NVIDIA DRA Driver<br/>DaemonSet<br/>UNIX Domain Socket"]:::star
+
+        cdi[("CDI JSON Specification<br/>/var/run/cdi/<br/>nvidia.com-gpu.json")]:::store
+
+        ctrd["containerd<br/>CRI Runtime"]:::dp
+
+        subgraph ISO["GPU Security and Isolation"]
+            direction TB
+            dev["Gate 1: Device Node Injection<br/>/dev/nvidia0<br/>/dev/nvidiactl<br/>/dev/nvidia-uvm<br/>/dev/nvidia-uvm-tools<br/>libcuda.so.1"]:::security
+
+            cg["Gate 2: Cgroups v2<br/>eBPF Device Filtering<br/>Allow gpu-0 ONLY"]:::security
+        end
+
+        storage[("Storage Mount<br/>/data/workspace<br/>Ceph PVC")]:::store
+
+        app["AIRuntime Pod<br/>JupyterLab :8888<br/>State: Running"]:::success
+    end
+
+    pod -->|"1. Pod created with GPU Claim"| rc
+    rc -->|"2. Scheduler reads claim"| sched
+    rs -.->|"3. Match GPU Inventory<br/>RTX 5090 >= 31Gi"| sched
+    sched -->|"4. Allocate gpu-0<br/>on worker-3 and bind Pod"| klet
+    klet -->|"5. NodePrepareResources<br/>gRPC call"| dra
+    dra -.->|"6. Validate GPU, clear VRAM<br/>Generate CDI JSON"| cdi
+    klet -->|"7. Create Container"| ctrd
+    cdi -.->|"8. Read CDI Instructions"| ctrd
+    ctrd -->|"9. Inject allocated GPU devices"| dev
+    ctrd -->|"10. Configure device access filter"| cg
+    ctrd -->|"11. Mount persistent storage"| storage
+    dev -->|"12. GPU device ready"| app
+    cg -->|"13. Security enforced"| app
+    storage -->|"14. Workspace mounted"| app
+
+    classDef cp fill:#e7e6fb,stroke:#6b6be0,color:#20233a
+    classDef dp fill:#cdeee7,stroke:#12a594,color:#10302b
+    classDef star fill:#ffe6a7,stroke:#d99a1c,stroke-width:2px,color:#3a2c07
+    classDef store fill:#e6e9ef,stroke:#5b6472,color:#20233a
+    classDef security fill:#fce4d6,stroke:#d97736,color:#542b12
+    classDef success fill:#d5f5df,stroke:#239653,stroke-width:2px,color:#123d25
 ```
 
 ---
 
-## 8. Summary of Findings & Sizing Recommendations
+### Step 6: Interactive Access Routing
 
-1. **Host Memory Sizing Guardrail:** Host RAM must always be provisioned to at least **1.25x the allocated GPU VRAM** (e.g. 96 GiB host RAM for an 80 GB card) to prevent checkpoint serialization aborts (`EOF`).
-2. **Minimal Runtime Cost:** Compute-bound workloads incur under **2.5% throughput overhead** inside gVisor, making `runsc-root-self` viable for production inferencing.
-3. **Massive Cold-Start Reduction:** Checkpoint warm-starting delivers between **3.8x and 7.5x faster readiness** than standard container cold-starting.
-4. **Zero Memory Leaks:** Across 10 back-to-back pause/restore cycles, physical VRAM is completely freed upon pod deletion and restored deterministically with standard deviation under 0.25 seconds.
+1. The container entrypoint executes JupyterLab on internal port `8888`.
+2. `airuntime-operator` creates an HTTP route via the Gateway API exposing `https://.../jupyter` secured by `JUPYTER_PASSWORD`.
+3. If SSH access was requested, the operator configures SSHPiper to proxy SSH connections to the pod's IP using tenant SSH public keys.
+4. The user connects via their browser and executes CUDA code on the bare-metal GPU.
+
+---
+
+### Step 7: Release on Stop (`reconcileStop`)
+
+1. When the user stops the AIRuntime, the **`AIRuntimeReconciler`** triggers `reconcileStop`:
+   - Deletes the Deployment / Pod.
+   - Deletes the `ResourceClaim`.
+   - Deleting the claim releases the device lock on `gpu-0`, making it immediately free for other users in the cluster.
+   - The PVC and `AIRuntime` custom resource are preserved, ensuring all files, notebooks, and checkpoints are safely kept.
+

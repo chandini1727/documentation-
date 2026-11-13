@@ -122,20 +122,20 @@ Inside the operator pod, two components handle the work:
 4. **Handoff to the Worker Node:**  
    The Master Node dispatches the assignment to `worker-3`, and that worker node takes over to prepare the hardware and launch the GPU Pod (Step 4).
 
-```mermaid
+
 flowchart LR
     %% -------------------------------------------------------------
     %% 1. CLIENT
     %% -------------------------------------------------------------
-    subgraph CLIENT_TIER [External]
+    subgraph CLIENT_TIER ["External"]
         cl["client<br/>(Console UI / Neev CLI)"]:::store
     end
 
     %% -------------------------------------------------------------
     %% 2. MANAGEMENT CLUSTER
     %% -------------------------------------------------------------
-    subgraph MGMT [MANAGEMENT CLUSTER - Central Control Plane]
-        subgraph MGMT_WORKERS [Worker Nodes - Ingress & System Pool]
+    subgraph MGMT ["MANAGEMENT CLUSTER - Central Control Plane"]
+        subgraph MGMT_WORKERS ["Worker Nodes - Ingress & System Pool"]
             gw["public-api-gateway"]:::cp
             asvc["airuntime-service"]:::star
             inv["inventory-service"]:::cp
@@ -145,20 +145,20 @@ flowchart LR
     end
 
     %% -------------------------------------------------------------
-    %% 3. REGIONAL CEPH STORAGE CLUSTER (PHYSICAL STORAGE)
+    %% 3. REGIONAL CEPH STORAGE CLUSTER
     %% -------------------------------------------------------------
-    subgraph STORAGE_TIER [REGIONAL STORAGE NETWORK]
+    subgraph STORAGE_TIER ["REGIONAL STORAGE NETWORK"]
         ceph_cluster[("Ceph Storage Cluster<br/>(MONs / OSDs)<br/>Actual Data & Files Live Here!")]:::ceph
     end
 
     %% -------------------------------------------------------------
     %% 4. WORKLOAD CLUSTER
     %% -------------------------------------------------------------
-    subgraph WKLD [REGIONAL WORKLOAD CLUSTER - Regional Data Plane]
+    subgraph WKLD ["REGIONAL WORKLOAD CLUSTER - Regional Data Plane"]
 
         %% MASTER / CONTROL PLANE NODES
-        subgraph WKLD_MASTER [Master / Control-Plane Nodes]
-            subgraph K8S [Regional K8s API Server & etcd (Cluster State & Metadata Store)]
+        subgraph WKLD_MASTER ["Master / Control-Plane Nodes"]
+            subgraph K8S ["Regional K8s API Server and etcd (Cluster State and Metadata Store)"]
                 cr_airuntime[("AIRuntime CR<br/>Status: Deploying")]:::k8s
                 pvc[("K8s PVC Object<br/>YAML Metadata Pointer only!")]:::k8s
                 rc[("ResourceClaim<br/>DRA CEL: RTX 5090 >= 31Gi")]:::k8s
@@ -169,15 +169,15 @@ flowchart LR
         end
 
         %% SYSTEM WORKER NODES (NO GPU)
-        subgraph WKLD_SYS_WORKER [Worker Nodes - System Pool / Non-GPU]
-            subgraph OP [airuntime-operator]
+        subgraph WKLD_SYS_WORKER ["Worker Nodes - System Pool / Non-GPU"]
+            subgraph OP ["airuntime-operator"]
                 actrl["airuntime-controller<br/>(Watcher / Informer)"]:::dp
                 arec["AIRuntimeReconciler<br/>(Worker)"]:::dp
             end
         end
 
         %% GPU COMPUTE WORKER NODES
-        subgraph WKLD_GPU_WORKER [Worker Nodes - GPU Compute Node: worker-3]
+        subgraph WKLD_GPU_WORKER ["Worker Nodes - GPU Compute Node: worker-3"]
             running_pod["AIRuntime Container / Pod<br/>(User Workload)"]:::gpu
             gpu_hw["Physical GPU<br/>(RTX 5090 / gpu-0)"]:::store
             csi_driver["Ceph CSI Node Plugin<br/>(DaemonSet Driver)"]:::dp
@@ -233,7 +233,7 @@ flowchart LR
     classDef k8s fill:#e6e9ef,stroke:#3b82f6,stroke-width:2px,color:#1e3a8a
     classDef gpu fill:#d1fae5,stroke:#059669,stroke-width:2px,color:#064e3b
     classDef ceph fill:#fef3c7,stroke:#b45309,stroke-width:2px,color:#78350f
-```
+
 
 
 ---

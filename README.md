@@ -123,109 +123,83 @@ Inside the operator pod, two components handle the work:
    The Master Node dispatches the assignment to `worker-3`, and that worker node takes over to prepare the hardware and launch the GPU Pod (Step 4).
 
 
+```mermaid
 flowchart LR
-    %% -------------------------------------------------------------
+
     %% 1. CLIENT
-    %% -------------------------------------------------------------
-    subgraph CLIENT_TIER ["External"]
+    subgraph CLIENT_TIER ["Client Tier (External)"]
         cl["client<br/>(Console UI / Neev CLI)"]:::store
     end
 
-    %% -------------------------------------------------------------
     %% 2. MANAGEMENT CLUSTER
-    %% -------------------------------------------------------------
-    subgraph MGMT ["MANAGEMENT CLUSTER - Central Control Plane"]
-        subgraph MGMT_WORKERS ["Worker Nodes - Ingress & System Pool"]
-            gw["public-api-gateway"]:::cp
-            asvc["airuntime-service"]:::star
-            inv["inventory-service"]:::cp
-            bill["billing-service"]:::cp
-            db[("PostgreSQL DB")]:::store
-        end
+    subgraph MGMT ["MANAGEMENT CLUSTER (Central Control Plane - Worker Nodes)"]
+        gw["public-api-gateway"]:::cp
+        asvc["airuntime-service<br/>(JWT Auth / Quota / CR Assembly)"]:::star
+        inv["inventory-service<br/>(5-min GPU Hold)"]:::cp
+        bill["billing-service<br/>(Validate Funds)"]:::cp
+        db[("PostgreSQL DB<br/>airuntimes / quotas")]:::store
     end
 
-    %% -------------------------------------------------------------
-    %% 3. REGIONAL CEPH STORAGE CLUSTER
-    %% -------------------------------------------------------------
-    subgraph STORAGE_TIER ["REGIONAL STORAGE NETWORK"]
-        ceph_cluster[("Ceph Storage Cluster<br/>(MONs / OSDs)<br/>Actual Data & Files Live Here!")]:::ceph
+    %% 3. WORKLOAD CLUSTER - MASTER NODES
+    subgraph WKLD_MASTER ["WORKLOAD CLUSTER - Master Nodes (State and Scheduler)"]
+        k8s_api[("Regional K8s API Server and etcd<br/>AIRuntime CR | PVC | ResourceClaim | Pod")]:::k8s
+        sched["kube-scheduler<br/>(DRA Plugin)"]:::star
     end
 
-    %% -------------------------------------------------------------
-    %% 4. WORKLOAD CLUSTER
-    %% -------------------------------------------------------------
-    subgraph WKLD ["REGIONAL WORKLOAD CLUSTER - Regional Data Plane"]
-
-        %% MASTER / CONTROL PLANE NODES
-        subgraph WKLD_MASTER ["Master / Control-Plane Nodes"]
-            subgraph K8S ["Regional K8s API Server and etcd (Cluster State and Metadata Store)"]
-                cr_airuntime[("AIRuntime CR<br/>Status: Deploying")]:::k8s
-                pvc[("K8s PVC Object<br/>YAML Metadata Pointer only!")]:::k8s
-                rc[("ResourceClaim<br/>DRA CEL: RTX 5090 >= 31Gi")]:::k8s
-                pod_obj[("AIRuntime Pod Spec<br/>State: Pending | nodeName: ''")]:::k8s
-                rs[("ResourceSlice<br/>Node GPU Catalog")]:::k8s
-            end
-            sched["kube-scheduler<br/>(DRA Plugin)"]:::star
-        end
-
-        %% SYSTEM WORKER NODES (NO GPU)
-        subgraph WKLD_SYS_WORKER ["Worker Nodes - System Pool / Non-GPU"]
-            subgraph OP ["airuntime-operator"]
-                actrl["airuntime-controller<br/>(Watcher / Informer)"]:::dp
-                arec["AIRuntimeReconciler<br/>(Worker)"]:::dp
-            end
-        end
-
-        %% GPU COMPUTE WORKER NODES
-        subgraph WKLD_GPU_WORKER ["Worker Nodes - GPU Compute Node: worker-3"]
-            running_pod["AIRuntime Container / Pod<br/>(User Workload)"]:::gpu
-            gpu_hw["Physical GPU<br/>(RTX 5090 / gpu-0)"]:::store
-            csi_driver["Ceph CSI Node Plugin<br/>(DaemonSet Driver)"]:::dp
-        end
+    %% 4. WORKLOAD CLUSTER - SYSTEM WORKER NODES
+    subgraph WKLD_SYS ["WORKLOAD CLUSTER - System Worker Nodes (Non-GPU)"]
+        actrl["airuntime-controller<br/>(Watcher / Informer)"]:::dp
+        arec["AIRuntimeReconciler<br/>(Worker)"]:::dp
     end
 
-    %% =============================================================
-    %% FLOW ARROWS
-    %% =============================================================
+    %% 5. WORKLOAD CLUSTER - GPU WORKER NODES
+    subgraph WKLD_GPU ["WORKLOAD CLUSTER - GPU Worker Node (worker-3)"]
+        running_pod["AIRuntime Pod<br/>(Active Container)"]:::gpu
+        gpu_hw["Physical GPU<br/>(RTX 5090 / gpu-0)"]:::store
+        csi_driver["Ceph CSI Node Plugin<br/>(DaemonSet Driver)"]:::dp
+    end
 
-    %% API FLOW
-    cl --->|"1 POST /airuntimes"| gw
-    gw --->|"2 forward"| asvc
-    asvc --->|"3 lookup"| db
-    asvc --->|"4 reserve hold"| inv
-    asvc --->|"5 check funds"| bill
-    asvc --->|"6 insert DB (pending)"| db
+    %% 6. REGIONAL STORAGE
+    subgraph CEPH_TIER ["REGIONAL STORAGE NETWORK (Dedicated Storage Cluster)"]
+        ceph_cluster[("Ceph Storage Cluster<br/>(OSDs and MONs - Physical Files)")]:::ceph
+    end
 
-    %% TO WORKLOAD MASTER
-    asvc ===|"7 post AIRuntime CR"| cr_airuntime
+    %% ==========================================
+    %% FLOW STEPS
+    %% ==========================================
 
-    %% OPERATOR RECONCILIATION
-    cr_airuntime --->|"8 watch"| actrl
-    actrl --->|"9 trigger"| arec
-    arec --->|"10 update Deploying"| cr_airuntime
-    arec --->|"11 verify PVC metadata is bound"| pvc
-    arec --->|"12 post ResourceClaim"| rc
-    arec --->|"13 post Pod Spec"| pod_obj
-    rc -..->|"referenced in spec"| pod_obj
-    pvc -..->|"referenced in spec"| pod_obj
+    %% Step 1: Client Request
+    cl -->|"1 POST /airuntimes"| gw
+    gw -->|"2 forward request"| asvc
+    asvc -->|"3 lookup template"| db
+    asvc -->|"4 reserve 5-min GPU hold"| inv
+    asvc -->|"5 validate funds"| bill
+    asvc -->|"6 insert DB (pending)"| db
 
-    %% SCHEDULING
-    pod_obj --->|"14 detect Pending"| sched
-    rc -.->|"evaluate CEL"| sched
-    rs -.->|"match GPU"| sched
-    sched --->|"15 lock gpu-0 & write nodeName='worker-3'"| pod_obj
+    %% Step 2: Cross-cluster call to Workload Master
+    asvc ==>|"7 post AIRuntime CR<br/>(Cross-Cluster K8s API Call)"| k8s_api
 
-    %% EXECUTION ON WORKER-3
-    pod_obj ===|"16 Kubelet starts Pod"| running_pod
-    gpu_hw -.->|"bind GPU"| running_pod
+    %% Step 3: Operator Reconciler on System Worker
+    k8s_api -->|"8 watch event"| actrl
+    actrl -->|"9 enqueue and trigger"| arec
+    arec -->|"10 update Phase='Deploying'"| k8s_api
+    arec -->|"11 verify PVC is bound"| k8s_api
+    arec -->|"12 post ResourceClaim"| k8s_api
+    arec -->|"13 post Pod spec (nodeName='')"| k8s_api
 
-    %% CEPH PHYSICAL CONNECTION
-    csi_driver ===|"17 Mounts network block device directly into /data/workspace"| running_pod
-    csi_driver <===>|"Read / Write disk blocks over storage network"| ceph_cluster
+    %% Step 4: Kube-Scheduler on Master
+    k8s_api -->|"14 detect Pending Pod and evaluate DRA claim"| sched
+    sched -->|"15 lock gpu-0 and set nodeName='worker-3'"| k8s_api
 
-    %% =============================================================
+    %% Step 5: GPU Worker Execution
+    k8s_api ==>|"16 Kubelet pulls and starts Pod"| running_pod
+    gpu_hw -.->|"allocated via DRA"| running_pod
+    csi_driver -->|"17 mount volume to /data/workspace"| running_pod
+    csi_driver ---|"Read / Write disk blocks over network"| ceph_cluster
+
+    %% ==========================================
     %% STYLING
-    %% =============================================================
+    %% ==========================================
     classDef cp fill:#e7e6fb,stroke:#6b6be0,color:#20233a
     classDef dp fill:#cdeee7,stroke:#12a594,color:#10302b
     classDef star fill:#ffe6a7,stroke:#d99a1c,stroke-width:2px,color:#3a2c07
@@ -233,8 +207,7 @@ flowchart LR
     classDef k8s fill:#e6e9ef,stroke:#3b82f6,stroke-width:2px,color:#1e3a8a
     classDef gpu fill:#d1fae5,stroke:#059669,stroke-width:2px,color:#064e3b
     classDef ceph fill:#fef3c7,stroke:#b45309,stroke-width:2px,color:#78350f
-
-
+```
 
 ---
 

@@ -122,85 +122,60 @@ Inside the operator pod, two components handle the work:
 4. **Handoff to the Worker Node:**  
    The Master Node dispatches the assignment to `worker-3`, and that worker node takes over to prepare the hardware and launch the GPU Pod (Step 4).
 
-Here is the updated **Flowchart 1 (Up to Step 3)** that clearly shows `airuntime-controller`, `AIRuntimeReconciler`, what is kept in the K8s API server, and how `kube-scheduler` comes into action:
 
 ```mermaid
-flowchart TD
-    %% 1. CLIENT & CONTROL PLANE
-    subgraph CP ["1. Control Plane (neevai-system)"]
-        cl["Client / Console UI"]:::client
-        gw["public-api-gateway"]:::cp
-        asvc["airuntime-service<br/>JWT/OPA | 5-min GPU Hold | DB"]:::cp
-        inv["inventory-service"]:::cp
-        db[("PostgreSQL DB")]:::store
+flowchart LR
+    cl["client<br/>Console UI / Neev CLI"]:::store
+
+    subgraph CP [Control Plane - neevai-system]
+        gw["public-api-gateway<br/>api.ai.neevcloud.com"]:::cp
+        asvc["airuntime-service<br/>JWT Auth | Quota | CR Assembly"]:::star
+        db[("PostgreSQL DB<br/>airuntimes | templates | quotas")]:::store
+        inv["inventory-service<br/>ReserveResources (5-min GPU hold)"]:::cp
     end
 
-    %% 2. KUBERNETES API SERVER
-    subgraph K8S ["2. Kubernetes API Server (Cluster State Store)"]
-        cr_airuntime[("AIRuntime CR<br/>(Spec: GPU, Image, Storage)")]:::k8s
-        cr_claim[("ResourceClaim<br/>DRA CEL: RTX 5090 >= 31Gi")]:::k8s
-        cr_pod[("AIRuntime Pod<br/>State: Pending | nodeName: ''")]:::k8s
-        pvc[("Ceph Storage PVC<br/>/data/workspace")]:::store
-        rs[("ResourceSlice Catalog<br/>Lists free GPUs on worker-3")]:::store
-    end
-
-    %% 3. AIRUNTIME-OPERATOR INTERNALS
-    subgraph AOP ["3. airuntime-operator (Leader Pod on Worker Node)"]
-        direction TB
-        subgraph CTRL ["airuntime-controller (The Watcher)"]
-            watcher["Informer Watch Loop<br/>Catches new AIRuntime CR<br/>Pushes to WorkQueue"]:::ctrl
+    subgraph DP [Data Plane - Regional Workload Cluster]
+        k8s[("K8s API Server<br/>etcd | regional endpoint")]:::store
+        
+        subgraph OP [airuntime-operator]
+            actrl["airuntime-controller<br/>(Watcher)"]:::dp
+            arec["AIRuntimeReconciler<br/>(Worker)"]:::dp
         end
 
-        subgraph REC ["AIRuntimeReconciler (The Worker)"]
-            direction TB
-            r_get["1. r.Get(): Reads CR into memory<br/>Validates GPU spec & image"]:::rec
-            r_status["2. Sets Status: Phase = 'Deploying'"]:::rec
-            r_pvc["3. Verifies Ceph PVC exists and is Bound"]:::rec
-            r_claim["4. Builds DRA ResourceClaim<br/>• Sets CEL Match Rule<br/>• Adds OwnerRef to AIRuntime CR"]:::rec
-            r_pod["5. Builds Pod Spec<br/>• Links ResourceClaim<br/>• Leaves nodeName empty ('')<br/>• Attaches Ceph PVC to /data/workspace"]:::rec
-        end
+        pvc[("Ceph Storage PVC<br/>(via storage-service)")]:::store
+        rc[("ResourceClaim<br/>DRA CEL: RTX 5090 >= 31Gi")]:::store
+        rs[("ResourceSlice<br/>(Worker-3 GPU Catalog)")]:::store
+        sched["kube-scheduler<br/>(DRA Plugin)"]:::star
+        pod["AIRuntime Pod<br/>State: Pending (awaiting GPU bind)"]:::dp
     end
 
-    %% 4. KUBE-SCHEDULER
-    subgraph SCHED ["4. kube-scheduler (DRA Scheduler Plugin)"]
-        sched_eval["Evaluates Pending Pod & Claim<br/>Matches CEL rule with ResourceSlice"]:::sched
-        sched_bind["Binds Pod to Node:<br/>• Locks gpu-0 on worker-3<br/>• Writes nodeName = 'worker-3'"]:::sched
-    end
+    cl --->|"1 POST /airuntimes"| gw
+    gw --->|"2 forward request"| asvc
+    asvc --->|"3 lookup template & quota"| db
+    db -..->|"4 template data & quota OK"| asvc
+    asvc --->|"5 reserve capacity hold"| inv
+    inv -..->|"6 5-min hold confirmed"| asvc
+    asvc --->|"7 insert row (provisioning)"| db
+    asvc --->|"8 dispatch AIRuntime CR"| k8s
 
-    %% CLIENT TO K8S API SERVER
-    cl -->|"1. POST /airuntimes"| gw
-    gw -->|"2. Forward request"| asvc
-    asvc -->|"3. Reserve 5-min hold"| inv
-    asvc -->|"4. Insert row (provisioning)"| db
-    asvc -->|"5. Post AIRuntime CR"| cr_airuntime
+    %% Operator Watcher & Worker
+    k8s --->|"9 watch event"| actrl
+    actrl --->|"10 trigger reconcile"| arec
+    arec --->|"11 verify storage ready"| pvc
+    arec --->|"12 create GPU claim in API server"| rc
+    arec --->|"13 create Pod (Pending, nodeName='')"| pod
+    pvc -..->|"storage attached"| pod
+    rc -..->|"claim attached"| pod
 
-    %% OPERATOR WATCH & RECONCILE
-    cr_airuntime -.->|"6. Watch event"| watcher
-    watcher -->|"7. Enqueue"| r_get
-    r_get --> r_status
-    r_status -.->|"8. Update Phase: Deploying"| cr_airuntime
-    r_status --> r_pvc
-    r_pvc -.->|"9. Verify Bound"| pvc
-    r_pvc --> r_claim
-    r_claim -->|"10. Post ResourceClaim"| cr_claim
-    r_claim --> r_pod
-    r_pod -->|"11. Post Pod (nodeName='')"| cr_pod
+    %% Scheduler Step at the end
+    rc -.->|"14 reads claim"| sched
+    rs -.->|"matches GPU"| sched
+    sched --->|"15 bind: set nodeName='worker-3'"| pod
 
-    %% SCHEDULER TAKES OVER
-    cr_pod -.->|"12. Picks up Pending Pod"| sched_eval
-    cr_claim -.->|"Reads claim rules"| sched_eval
-    rs -.->|"Reads GPU inventory"| sched_eval
-    sched_eval --> sched_bind
-    sched_bind -->|"13. Binds: nodeName='worker-3'"| cr_pod
-
-    %% STYLING
-    classDef client fill:#f0f4f8,stroke:#4a5568,color:#1a202c
     classDef cp fill:#e7e6fb,stroke:#6b6be0,color:#20233a
-    classDef k8s fill:#e6e9ef,stroke:#5b6472,color:#20233a
+    classDef dp fill:#cdeee7,stroke:#12a594,color:#10302b
+    classDef star fill:#ffe6a7,stroke:#d99a1c,stroke-width:2px,color:#3a2c07
     classDef store fill:#e6e9ef,stroke:#5b6472,color:#20233a
-    classDef ctrl fill:#fef3c7,stroke:#d97706,stroke-width:2px,color:#78350f
-    classDef rec fill:#ffedd5,stroke:#ea580c,stroke-width:2px,color:#7c2d12
-    classDef sched fill:#f3e8ff,stroke:#9333ea,stroke-width:2px,color:#581c87
 ```
 ---
 

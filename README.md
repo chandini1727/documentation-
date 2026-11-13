@@ -374,16 +374,7 @@ flowchart LR
 
 ---
 
-### Step 6: Interactive Access Routing
-
-1. The container entrypoint executes JupyterLab on internal port `8888`.
-2. `airuntime-operator` creates an HTTP route via the Gateway API exposing `https://.../jupyter` secured by `JUPYTER_PASSWORD`.
-3. If SSH access was requested, the operator configures SSHPiper to proxy SSH connections to the pod's IP using tenant SSH public keys.
-4. The user connects via their browser and executes CUDA code on the bare-metal GPU.
-
----
-
-### Step 7: Release on Stop (`reconcileStop`)
+### Step 6: Release on Stop (`reconcileStop`)
 
 1. When the user stops the AIRuntime, the **`AIRuntimeReconciler`** triggers `reconcileStop`:
    - Deletes the Deployment / Pod.

@@ -183,47 +183,47 @@ flowchart LR
     end
 
     %% =============================================================
-    %% FLOW ARROWS
+    %% FLOW ARROWS (With concise & wrapped labels to stay on lines)
     %% =============================================================
 
     %% API Gateway & Control Plane
-    cl -->|"1 POST /airuntimes"| gw
-    gw -->|"2 forward"| asvc
-    asvc -->|"3 lookup template"| db
-    asvc -->|"4 hold GPU"| inv
-    asvc -->|"5 check credits"| bill
-    asvc -->|"6 insert pending record"| db
+    cl --->|"1 POST /airuntimes"| gw
+    gw --->|"2 forward"| asvc
+    asvc --->|"3 lookup"| db
+    asvc --->|"4 hold GPU"| inv
+    asvc --->|"5 check credits"| bill
+    asvc --->|"6 insert pending"| db
 
     %% Post CR
-    asvc ==>|"7 post AIRuntime CR"| cr_airuntime
+    asvc ====>|"7 post CR<br/>(cross-cluster)"| cr_airuntime
 
     %% Controller Triggers Reconciler
-    cr_airuntime -->|"8 watch"| actrl
-    actrl -->|"9 trigger"| arec
-    arec -->|"10 update Phase='Deploying'"| cr_airuntime
-    arec -->|"11 check PVC bound"| pvc
+    cr_airuntime --->|"8 watch"| actrl
+    actrl --->|"9 trigger"| arec
+    arec --->|"10 set Deploying"| cr_airuntime
+    arec --->|"11 check PVC"| pvc
 
     %% PREPARE & POST RESOURCECLAIM
-    arec -->|"12 prepare GPU claim request"| prep_claim
-    prep_claim ==>|"13 post ResourceClaim to API server"| rc
+    arec --->|"12 prepare claim"| prep_claim
+    prep_claim ====>|"13 post ResourceClaim"| rc
 
     %% PREPARE & POST POD SPEC
-    prep_claim -->|"14 trigger pod spec preparation"| prep_pod
-    rc -.->|"claim name attached to pod"| prep_pod
-    pvc -.->|"volume mount attached to pod"| prep_pod
-    prep_pod ==>|"15 post Pod spec to API server"| pod_obj
+    prep_claim --->|"14 prepare pod"| prep_pod
+    rc -..->|"claim name"| prep_pod
+    pvc -..->|"volume mount"| prep_pod
+    prep_pod ====>|"15 post Pod spec"| pod_obj
 
     %% SCHEDULER EVALUATION
-    pod_obj -->|"16 detect Pending Pod"| sched
-    rc -.->|"read claim rules"| sched
-    rs -.->|"find available GPU"| sched
-    sched ==>|"17 bind gpu-0 and set nodeName='worker-3'"| pod_obj
+    pod_obj --->|"16 detect Pending"| sched
+    rc -..->|"claim rules"| sched
+    rs -..->|"match GPU"| sched
+    sched ====>|"17 bind gpu-0<br/>set worker-3"| pod_obj
 
     %% EXECUTION ON GPU NODE
-    pod_obj ==>|"18 Kubelet launches Pod"| running_pod
-    gpu_hw -.->|"attach GPU"| running_pod
-    csi_driver -->|"19 mount /data/workspace"| running_pod
-    csi_driver ---|"network storage"| ceph_cluster
+    pod_obj ====>|"18 launch Pod"| running_pod
+    gpu_hw -..->|"attach GPU"| running_pod
+    csi_driver --->|"19 mount storage"| running_pod
+    csi_driver ----|"network storage"| ceph_cluster
 
     %% =============================================================
     %% STYLING

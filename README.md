@@ -1,14 +1,12 @@
+# Dynamic Resource Allocation (DRA) & AIRuntime Architecture Specification
+
 ## Definition of DRA (Dynamic Resource Allocation)
 
-**Dynamic Resource Allocation (DRA)** is a Kubernetes feature that allows applications to request GPUs by specifying their exact hardware requirements—such as GPU model name and VRAM memory size—instead of just asking for a simple number like "1 GPU".
+**Dynamic Resource Allocation (DRA)** is a Kubernetes feature that allows applications to request GPUs by specifying their exact hardware requirements—such as GPU model name and VRAM memory size—instead of just asking for a simple number like `"1 GPU"`.
 
-In traditional Kubernetes setups, GPUs were treated as plain numbers (`nvidia.com/gpu: 1`), with no visibility into a card's actual model or memory size. In contrast, DRA treats every physical GPU as an individual device with its own detailed profile (model name, VRAM capacity, PCIe address, and health status).
+In traditional Kubernetes GPU allocation, GPUs were requested using a simple resource count, such as `nvidia.com/gpu: 1`. Kubernetes knew how many GPUs were requested but did not provide detailed device-level information through this resource request, such as the GPU model, VRAM capacity, or PCIe address.
 
-To manage devices cleanly, DRA divides the workflow into three steps:
-
-1. **Hardware Inventory (`ResourceSlice`):** Worker nodes publish an exact list of the physical GPUs they have in stock.
-2. **Workload Requests (`ResourceClaim`):** Pods specify the exact hardware they need using search filters written in Common Expression Language (CEL).
-3. **Container Attachment (CDI):** Once Kubernetes matches a pod to a GPU, it uses the Container Device Interface (CDI) to safely attach that specific card into the container.
+With Dynamic Resource Allocation (DRA), each physical GPU is represented as an individual device. This allows Kubernetes to identify and manage GPUs separately, along with their device information, such as GPU model, VRAM capacity, PCIe address, and health status.
 
 ---
 
@@ -16,42 +14,153 @@ To manage devices cleanly, DRA divides the workflow into three steps:
 
 The complete lifecycle of an AIRuntime from API call to active GPU execution follows these 7 distinct steps:
 
-### Step 1: Request Validation, Capacity Hold, and Blueprint Submission (`airuntime-service`)
+### Step 1: From User API Request to Kubernetes CR Creation (`airuntime-service`)
 
-1. **User Action & API Call:** The user submits a request from the UI to `POST /api/v1beta1/orgs/{org_id}/projects/{project_id}/airuntimes` specifying the runtime name, template ID, GPU hardware config ID, GPU count, region, plan ID, persistent storage size, and optional SSH keys.
-2. **Template & Container Image Resolution:** `airuntime-service` queries the database for the selected template (`s.queries.GetAIRuntimeTemplate`) to resolve the container image (`template.Image`), application ports (JupyterLab on port 8888), default environment variables, and any private registry credentials.
-3. **Authentication, Quotas, and Plan Verification:** Validates user JWT authentication, verifies project compute quotas, and ensures the billing `planId` matches the requested GPU hardware configuration.
-4. **Admission Capacity Hold (`inventory-service`):** Calls `inventoryClient.ReserveResources` to place a temporary 5-minute capacity hold in the database (`resource_reservations` table), preventing concurrent GPU VM or model deployment requests from taking the last GPU before this runtime is provisioned.
-5. **Database Record Creation:** Inserts a new row into the PostgreSQL `airuntimes` table with initial status `provisioning` and stores the reservation ID.
-6. **Build Blueprint (`AIRuntime` Custom Resource):** Calls `BuildAIRuntimeCR()` to assemble the `AIRuntime` CR (`ai.neevcloud.com/v1alpha1`) containing the target namespace, GPU specifications (model, VRAM, count), resolved container image, Ceph persistent storage configuration, and a randomly generated Jupyter password annotation.
-7. **Submit Blueprint to Workload Cluster (`k8sClient.Create`):** Posts the `AIRuntime` CR to the Workload Cluster API server via `k8sClient.Create(ctx, cr)`, handing off execution to the `airuntime-operator`.
+This step covers everything that happens from the moment a user clicks **"Create"** in the UI until the workload blueprint (the `AIRuntime` Custom Resource) is created and handed over to Kubernetes:
+
+1. **User Action & API Submission:**  
+   The user chooses their GPU (e.g., RTX 5090), software template (e.g., PyTorch), region, and storage in the UI, then clicks **Create**. The UI sends an HTTP request:  
+   `POST /api/v1beta1/orgs/{org_id}/projects/{project_id}/airuntimes`
+
+2. **Gateway Forwarding (TLS Termination & Routing):**  
+   The request hits **`public-api-gateway`** (Istio Ingress Gateway at `api.ai.neevcloud.com`).  
+   - The gateway decrypts HTTPS (TLS termination).  
+   - It does **not** authenticate the user. It acts as an L7 reverse proxy, forwarding the raw HTTP request and `Authorization: Bearer <token>` header directly to `airuntime-service`.
+
+3. **Authentication & Authorization (`airuntime-service`):**  
+   Inside `airuntime-service`, built-in middleware processes the request:  
+   - **JWT Validation:** Validates the signature of the Bearer token and extracts `user_id`.  
+   - **OPA Permission Check:** Queries Open Policy Agent (OPA) to confirm the user has permission to create GPU workloads in this project.
+
+4. **Template Specification & Workload Resolution:**  
+   `airuntime-service` queries the `airuntime_templates` database table using the requested `template_id` to determine:  
+   - **Container Image:** The exact Docker image to pull and execute on the GPU (e.g., `pytorch-jupyter:v2.4`).  
+   - **Application & Port Configuration:** The interactive applications to expose and their network ports (e.g., JupyterLab on port `8888` with an auto-generated secure login password).
+
+5. **GPU Hardware Validation (`inventoryClient.GetGpuConfig`):**  
+   `airuntime-service` calls `inventory-service` using `gpu_config_id` to confirm physical hardware specs:  
+   - GPU Model: `NVIDIA GeForce RTX 5090`  
+   - VRAM: `32 GiB`  
+   - CPU & System RAM allocations.
+
+6. **Atomic 5-Minute Capacity Hold (`inventoryClient.ReserveResources`):**  
+   Before creating anything in Kubernetes, `airuntime-service` calls `inventory-service` to place a temporary **5-minute lock** on 1 physical GPU in that region.  
+   - *Why:* To immediately secure the hardware so concurrent users cannot take the last GPU.
+
+7. **Wallet Balance & Billing Verification (`billingClient.ValidateFunds`):**  
+   Calls `billing-service` to ensure:  
+   - The selected billing plan matches the GPU model.  
+   - The user/organization has sufficient wallet balance (at least 1 hour of credits for on-demand usage). *(If this fails, the capacity hold is immediately released).*
+
+8. **Storage Setup & Validation:**  
+   Checks the user's storage choice:  
+   - If reusing an existing volume, verifies it is in `bound` state in that region.  
+   - If requesting a new volume, calls `storage-service` to provision a Ceph network volume to be mounted at `/data/workspace`.
+
+9. **Database Record Creation (`s.queries.CreateAIRuntime`):**  
+   Inserts a new row into the PostgreSQL `airuntimes` table with initial status **`pending`**, and generates a secure 16-character login password for JupyterLab.
+
+10. **Build and Post Custom Resource:**  
+    `airuntime-service` builds the custom resource and posts it to the regional Kubernetes API server.
 
 ---
 
-### Step 2: Operator Creates Storage, GPU Claim, and Pod (`airuntime-operator`)
+### Step 2: Operator Creates the GPU Claim and Workload Pod (`airuntime-operator`)
 
-When the `airuntime-operator` sees the new `AIRuntime` CR in the Kubernetes API server, it does three things:
+`airuntime-operator` runs in GPU worker nodes. To prevent conflicts, it runs under Kubernetes **Leader Election** (`1a4350ec.ai.neevcloud.com`), ensuring only one active leader pod processes requests at a time while standby copies wait for automatic failover.
 
-1. **Creates the Storage Mount (PVC):** If persistent storage is requested, it ensures a `PersistentVolumeClaim` is ready to mount at `/data/workspace` so user files are never lost.
-2. **Creates the GPU Request (`ResourceClaim`):** It submits a `ResourceClaim` to Kubernetes asking for the exact GPU needed:
+Inside the operator pod, two components handle the work:
+* **`airuntime-controller` (The Watcher):** Watches the Kubernetes API server for new or updated `AIRuntime` custom resources.
+* **`AIRuntimeReconciler` (The Worker):** Takes the request and executes the actual work step-by-step.
+
+---
+
+#### Step-by-Step Execution:
+
+1. **Catches the Request (`airuntime-controller`):**  
+   The controller sees the new `AIRuntime` Custom Resource (CR) in the API server and puts it into the work queue.
+
+2. **Loads and Validates the CR (`AIRuntimeReconciler`):**  
+   The reconciler reads the CR into memory via `r.Get()` and confirms the GPU model, configuration ID, and Docker container image are valid.
+
+3. **Sets Status to `Deploying`:**  
+   Updates the runtime phase to `Deploying` (`Status.Phase = "Deploying"`) so users and backend services know provisioning has started.
+
+4. **Checks Storage (Ceph PVC):**  
+   Verifies that the Ceph storage volume (PVC) exists in the project namespace. If the volume is not ready yet, it pauses and retries in 5 seconds.
+
+5. **Creates the GPU Claim (`ResourceClaim`):**  
+   The reconciler builds a DRA `ResourceClaim` specifying the required GPU model and VRAM using a CEL rule, sets the `AIRuntime` CR as its owner, and posts it to the Kubernetes API server:
 
    ```cel
    device.attributes['gpu.nvidia.com'].productName == 'NVIDIA GeForce RTX 5090' &&
    device.capacity['gpu.nvidia.com'].memory.compareTo(quantity('31Gi')) >= 0
    ```
 
-3. **Creates the Pod Object:** It creates the Pod in Kubernetes with container image (`pytorch-jupyter:v2.4`), storage mount (`/data/workspace`), and attaches the GPU `ResourceClaim`. *(The Pod is created in `Pending` state and does not run yet).*
+6. **Creates the Pod Spec and Adds the ResourceClaim:**  
+   The reconciler builds the Pod specification and attaches the GPU `ResourceClaim` to it:
+   - Sets the container image (e.g., PyTorch + JupyterLab).
+   - Mounts the Ceph storage volume at `/data/workspace`.
+   - Adds the GPU `ResourceClaim` under `pod.spec.resourceClaims`.
+   - Injects the JupyterLab login password.
+   - Leaves `nodeName` empty (`""`) so the scheduler can pick the physical node.
+   - Sends the Pod specification to the Kubernetes API server.
 
 ---
 
-### Step 3: Scheduler Matches the Claim to a GPU Node (`kube-scheduler`)
+### Step 3: Scheduler Matches the Workload to a GPU Node (`kube-scheduler`)
 
-Once the Pod and its `ResourceClaim` are in Kubernetes, `kube-scheduler` handles the matching:
+1. **GPU Catalogs on the Master Node (`ResourceSlice`):**  
+   Every GPU worker node registers its physical cards with the **Master Node** (API Server). The Master Node stores these `ResourceSlice` catalogs listing all available GPUs across the cluster.
 
-1. **Reads the Claim:** The scheduler sees the pending Pod asking for a GPU via its `ResourceClaim`.
-2. **Checks Node Hardware (`ResourceSlice`):** It checks the hardware catalog (`ResourceSlice`) published by all worker nodes to find a node that has a free card matching the GPU model and VRAM.
-3. **Locks the GPU:** It finds an available RTX 5090 (`gpu-0`) on `worker-3`, writes `worker-3, gpu-0` into `ResourceClaim.status.allocation`, and locks the card so no other workload can take it.
-4. **Places the Pod on the Node:** It binds the Pod to `worker-3` so the node can start preparing the hardware.
+2. **Scheduler Checks the Master Node Catalog:**  
+   Running on the Master Node, **`kube-scheduler`** inspects the `ResourceSlice` records to find a worker node with a free RTX 5090.
+
+3. **Locks the GPU and Binds to the Worker Node:**  
+   The scheduler locks the chosen GPU (e.g., `gpu-0` on `worker-3`) and assigns the workload to that worker node (`pod.spec.nodeName = "worker-3"`).
+
+4. **Handoff to the Worker Node:**  
+   The Master Node dispatches the assignment to `worker-3`, and that worker node takes over to prepare the hardware and launch the GPU Pod (Step 4).
+
+```mermaid
+flowchart LR
+    cl["client<br/>Console UI / Neev CLI"]:::store
+
+    subgraph CP [Control Plane - neevai-system]
+        gw["public-api-gateway<br/>api.ai.neevcloud.com"]:::cp
+        asvc["airuntime-service<br/>JWT Auth | Quota | CR Assembly"]:::star
+        db[("PostgreSQL DB<br/>airuntimes | templates | quotas")]:::store
+        inv["inventory-service<br/>ReserveResources (5-min GPU hold)"]:::cp
+    end
+
+    subgraph DP [Data Plane - Regional Workload Cluster]
+        k8s[("K8s API Server<br/>etcd | regional endpoint")]:::store
+        aop["airuntime-operator<br/>AIRuntime Controller"]:::dp
+        pvc[("Ceph Storage PVC<br/>(via storage-service)")]:::store
+        rc[("ResourceClaim<br/>DRA CEL: RTX 5090 >= 31Gi")]:::store
+        pod["AIRuntime Pod<br/>State: Pending (awaiting GPU bind)"]:::dp
+    end
+
+    cl --->|"1 POST /airuntimes"| gw
+    gw --->|"2 forward request"| asvc
+    asvc --->|"3 lookup template & quota"| db
+    db -..->|"4 template data & quota OK"| asvc
+    asvc --->|"5 reserve capacity hold"| inv
+    inv -..->|"6 5-min hold confirmed"| asvc
+    asvc --->|"7 insert row (provisioning)"| db
+    asvc --->|"8 dispatch AIRuntime CR"| k8s
+    k8s --->|"9 watch event"| aop
+    aop --->|"10 verify storage ready"| pvc
+    aop --->|"11 create GPU claim"| rc
+    aop --->|"12 create Pod (Pending)"| pod
+    pvc -..->|"storage attached"| pod
+    rc -..->|"claim attached"| pod
+
+    classDef cp fill:#e7e6fb,stroke:#6b6be0,color:#20233a
+    classDef dp fill:#cdeee7,stroke:#12a594,color:#10302b
+    classDef star fill:#ffe6a7,stroke:#d99a1c,stroke-width:2px,color:#3a2c07
+    classDef store fill:#e6e9ef,stroke:#5b6472,color:#20233a
+```
 
 ---
 
@@ -131,6 +240,63 @@ By default, a container is isolated and cannot see or access the physical GPU on
 
    - The Pod officially transitions from `Pending` to **`Running`**.
 
+```mermaid
+flowchart LR
+    pod["AIRuntime Pod<br/>Operator Created<br/>State: Pending"]:::star
+
+    subgraph CP["Cluster Control Plane (Master Node)"]
+        direction TB
+        rc[("ResourceClaim<br/>RTX 5090 >= 31Gi")]:::store
+        rs[("ResourceSlice<br/>Node GPU Catalog")]:::store
+        sched["kube-scheduler<br/>DRA Plugin<br/>CEL Evaluation"]:::cp
+    end
+
+    subgraph DP["GPU Worker Node - worker-3"]
+        direction TB
+
+        klet["kubelet Agent<br/>Node Supervisor"]:::dp
+
+        dra["NVIDIA DRA Driver<br/>DaemonSet<br/>UNIX Domain Socket"]:::star
+
+        cdi[("CDI JSON Specification<br/>/var/run/cdi/<br/>nvidia.com-gpu.json")]:::store
+
+        ctrd["containerd<br/>CRI Runtime"]:::dp
+
+        subgraph ISO["GPU Security and Isolation"]
+            direction TB
+            dev["Gate 1: Device Node Injection<br/>/dev/nvidia0<br/>/dev/nvidiactl<br/>/dev/nvidia-uvm<br/>/dev/nvidia-uvm-tools<br/>libcuda.so.1"]:::security
+
+            cg["Gate 2: Cgroups v2<br/>eBPF Device Filtering<br/>Allow gpu-0 ONLY"]:::security
+        end
+
+        storage[("Storage Mount<br/>/data/workspace<br/>Ceph PVC")]:::store
+
+        app["AIRuntime Pod<br/>JupyterLab :8888<br/>State: Running"]:::success
+    end
+
+    pod -->|"1. Pod created with GPU Claim"| rc
+    rc -->|"2. Scheduler reads claim"| sched
+    rs -.->|"3. Match GPU Inventory<br/>RTX 5090 >= 31Gi"| sched
+    sched -->|"4. Allocate gpu-0<br/>on worker-3 and bind Pod"| klet
+    klet -->|"5. NodePrepareResources<br/>gRPC call"| dra
+    dra -.->|"6. Validate GPU, clear VRAM<br/>Generate CDI JSON"| cdi
+    klet -->|"7. Create Container"| ctrd
+    cdi -.->|"8. Read CDI Instructions"| ctrd
+    ctrd -->|"9. Inject allocated GPU devices"| dev
+    ctrd -->|"10. Configure device access filter"| cg
+    ctrd -->|"11. Mount persistent storage"| storage
+    dev -->|"12. GPU device ready"| app
+    cg -->|"13. Security enforced"| app
+    storage -->|"14. Workspace mounted"| app
+
+    classDef cp fill:#e7e6fb,stroke:#6b6be0,color:#20233a
+    classDef dp fill:#cdeee7,stroke:#12a594,color:#10302b
+    classDef star fill:#ffe6a7,stroke:#d99a1c,stroke-width:2px,color:#3a2c07
+    classDef store fill:#e6e9ef,stroke:#5b6472,color:#20233a
+    classDef security fill:#fce4d6,stroke:#d97736,color:#542b12
+    classDef success fill:#d5f5df,stroke:#239653,stroke-width:2px,color:#123d25
+```
+
 ---
 
 ### Step 6: Interactive Access Routing
@@ -144,280 +310,9 @@ By default, a container is isolated and cannot see or access the physical GPU on
 
 ### Step 7: Release on Stop (`reconcileStop`)
 
-1. When the user stops the AIRuntime, `airuntime-controller` triggers `reconcileStop`:
+1. When the user stops the AIRuntime, the **`AIRuntimeReconciler`** triggers `reconcileStop`:
    - Deletes the Deployment / Pod.
    - Deletes the `ResourceClaim`.
    - Deleting the claim releases the device lock on `gpu-0`, making it immediately free for other users in the cluster.
    - The PVC and `AIRuntime` custom resource are preserved, ensuring all files, notebooks, and checkpoints are safely kept.
 
----
-
-# Architectural Placement & End-to-End Execution Flows
-
-To ensure anyone reviewing this architecture can clearly trace **where each component lives**, **how the request enters**, and **how the DRA driver prepares and attaches the GPU into the Pod**, the system is structured into 3 clean, progressive flows following the standard RFC layout:
-
-- **Flow 1: Request Ingestion, Admission & Blueprint Assembly** (Client → Control Plane → Operator)
-- **Flow 2: DRA Scheduling, Node Preparation & Container CDI Attachment** (Scheduler → Kubelet → DRA Driver DaemonSet → CDI → containerd)
-- **Flow 3: Interactive Ingress Routing & Release on Stop** (Gateway API → Running Pod → Teardown Cleanup)
-
----
-
-## Flow 1: Request Ingestion, Admission & Blueprint Assembly
-
-When a user initiates the creation of an AIRuntime instance via the Web Console or CLI, the request is ingested and verified by the **Control Plane (CP)** before being dispatched to the target **Data Plane (DP / Regional Workload Cluster)** where the physical GPUs and storage reside.
-
-### Detailed Flow Steps
-
-1. **Client Request:**  
-   The client (Browser Console or Neev CLI) issues a `POST /api/v1beta1/orgs/{org_id}/projects/{project_id}/airuntimes` request specifying runtime name, template ID (e.g., PyTorch), GPU model SKU, GPU count, target region, pricing plan ID, and optional persistent storage size.
-
-2. **Ingress Forwarding:**  
-   The request hits **`public-api-gateway`** (`api.ai.neevcloud.com`) in the Control Plane. The gateway terminates TLS, validates the JWT Bearer token, and routes the request to **`airuntime-service`** in namespace `neevai-system`.
-
-3. **Template & Quota Lookup:**  
-   `airuntime-service` queries the central **PostgreSQL DB** (`s.queries.GetAIRuntimeTemplate`) to resolve the container image, default application ports (JupyterLab on port `8888`), and asserts that project compute quotas are sufficient.
-
-4. **Template Data Returned:**  
-   PostgreSQL returns the template configuration, image registry pull credentials, and confirms quota availability.
-
-5. **Reserve Capacity Hold:**  
-   `airuntime-service` makes an internal RPC call to **`inventory-service`** (`ReserveResources`) to acquire an atomic 5-minute capacity hold in the `resource_reservations` table. This prevents concurrent users from taking the last GPU before this instance is scheduled.
-
-6. **Capacity Hold Confirmed:**  
-   `inventory-service` returns the reservation ID confirming the GPU capacity is temporarily locked.
-
-7. **Database Record Creation:**  
-   `airuntime-service` inserts a new row into the PostgreSQL `airuntimes` table with initial state `provisioning` and stores the reservation ID.
-
-8. **Dispatch Blueprint to Regional Workload Cluster:**  
-   `airuntime-service` invokes `BuildAIRuntimeCR()` to assemble the `AIRuntime` Custom Resource (`ai.neevcloud.com/v1alpha1`). Using the regional Kubernetes client matching the target region (`s.k8sClients[airuntime.Region]`), it submits the CR to the **Data Plane K8s API Server**.
-
-9. **Watch Event Triggered:**  
-   The **`airuntime-operator`** running inside the regional Workload Cluster receives the new `AIRuntime` CR event through its controller watch loop.
-
-10. **Storage Setup (Conditional):**
-    - **If Persistent Storage was requested:** The operator creates a Ceph-backed **`PersistentVolumeClaim` (PVC)** mounted at `/data/workspace` so files persist across stop/start cycles.
-    - **If Persistent Storage was NOT requested:** **No PVC is created.** The operator configures an ephemeral scratch disk (`emptyDir`).
-
-11. **Create DRA GPU Request (`ResourceClaim`):**  
-    The operator creates a Kubernetes `ResourceClaim` with the CEL hardware predicate:
-
-    ```cel
-    device.attributes['gpu.nvidia.com'].productName == 'NVIDIA GeForce RTX 5090' &&
-    device.capacity['gpu.nvidia.com'].memory.compareTo(quantity('31Gi')) >= 0
-    ```
-
-12. **Create Pod (`Pending`):**  
-    The operator creates the workload Pod attaching the storage (PVC or `emptyDir`) and referencing the GPU `ResourceClaim`. The Pod is placed in **`Pending`** state, ready for the Kubernetes scheduler and DRA driver to match and attach the physical GPU in Flow 2.
-
-### Flow 1 Diagram (RFC Style)
-
-```mermaid
-flowchart LR
-    cl["client<br/>Console UI / Neev CLI"]:::store
-
-    subgraph CP [Control Plane - neevai-system]
-        gw["public-api-gateway<br/>api.ai.neevcloud.com"]:::cp
-        asvc["airuntime-service<br/>JWT Auth · Quota · CR Assembly"]:::star
-        db[("PostgreSQL DB<br/>airuntimes · templates · quotas")]:::store
-        inv["inventory-service<br/>ReserveResources (5-min GPU hold)"]:::cp
-    end
-
-    subgraph DP [Data Plane - Regional Workload Cluster]
-        k8s[("K8s API Server<br/>etcd · regional endpoint")]:::store
-        aop["airuntime-operator<br/>AIRuntime Controller"]:::dp
-        pvc[("Storage Mount<br/>Ceph PVC (if requested)<br/>OR emptyDir (ephemeral)")]:::store
-        rc[("ResourceClaim<br/>DRA CEL: RTX 5090 >= 31Gi")]:::store
-        pod["AIRuntime Pod<br/>State: Pending (awaiting GPU bind)"]:::dp
-    end
-
-    cl --->|"1 POST /airuntimes"| gw
-    gw --->|"2 forward request"| asvc
-    asvc --->|"3 lookup template & quota"| db
-    db -..->|"4 template data & quota OK"| asvc
-    asvc --->|"5 reserve capacity hold"| inv
-    inv -..->|"6 5-min hold confirmed"| asvc
-    asvc --->|"7 insert row (provisioning)"| db
-    asvc --->|"8 dispatch AIRuntime CR"| k8s
-    k8s --->|"9 watch event"| aop
-    aop --->|"10 setup storage (PVC or emptyDir)"| pvc
-    aop --->|"11 create GPU claim"| rc
-    aop --->|"12 create Pod (Pending)"| pod
-    pvc -..->|"storage attached"| pod
-    rc -..->|"claim attached"| pod
-
-    classDef cp fill:#e7e6fb,stroke:#6b6be0,color:#20233a
-    classDef dp fill:#cdeee7,stroke:#12a594,color:#10302b
-    classDef star fill:#ffe6a7,stroke:#d99a1c,stroke-width:2px,color:#3a2c07
-    classDef store fill:#e6e9ef,stroke:#5b6472,color:#20233a
-```
-# Flow 2: DRA Scheduling, Node Preparation & Container CDI Device Attachment
-
-### The Big Picture (What Flow 2 Does)
-
-At the end of Flow 1, your Pod was created in **`Pending`** state with a **`ResourceClaim`** asking for a GPU (e.g., RTX 5090 with ≥ 31GiB VRAM).
-
-Flow 2 is the engine that:
-
-1. **Finds** which server in the cluster has that exact free GPU.
-2. **Prepares** the hardware on that server (wipes old GPU memory).
-3. **Locks down & attaches** *only* that specific card into the container so other GPUs on that machine remain completely invisible.
-4. **Launches** the container, moving the Pod from **`Pending` → `Running`**.
-
----
-
-## Detailed Step-by-Step Breakdown
-
-### Phase 1: Finding & Locking the GPU (`kube-scheduler`)
-
-#### Step 1: Scheduler Detects the Pending Pod & Claim
-
-- The Kubernetes scheduler (`kube-scheduler`) picks up the newly created Pod from the queue.
-- It sees that the Pod cannot run yet because its attached **`ResourceClaim`** has not been allocated a physical GPU.
-
-#### Step 2: Evaluates Node Hardware Catalog (`ResourceSlice`)
-
-- Every GPU node in the cluster publishes an inventory list called a **`ResourceSlice`**. This list tells Kubernetes exactly what physical cards are installed (model name, available VRAM, PCIe addresses, and health status).
-- The scheduler runs the CEL search filter from the claim against all nodes:
-
-```cel
-device.attributes['gpu.nvidia.com'].productName == 'NVIDIA GeForce RTX 5090' &&
-device.capacity['gpu.nvidia.com'].memory >= 31Gi
-```
-
-#### Step 3: Locks the GPU and Binds the Pod
-
-- The scheduler finds a matching, healthy card: **`gpu-0`** on **`worker-3`**.
-- It writes `worker-3, gpu-0` into `ResourceClaim.status.allocation`. This **locks the GPU** so no other workload in the cluster can steal it.
-- The scheduler binds the Pod to `worker-3`.
-
----
-
-### Phase 2: Node Hardware Preparation (`kubelet` & NVIDIA Driver)
-
-#### Step 4: Kubelet Receives the Workload
-
-- The **`kubelet`** agent running locally on `worker-3` receives notification that a new Pod has been assigned to its machine.
-- It inspects the Pod and detects that it requires a DRA device allocation (`gpu-claim`).
-
-#### Step 5: `NodePrepareResources` gRPC Call
-
-- To interact with physical PCIe cards, `kubelet` connects to the local **NVIDIA DRA Driver DaemonSet pod** running on that same server over a local UNIX domain socket (`/var/run/cdi/...`).
-- It invokes the gRPC function: **`NodePrepareResources`**.
-
-#### Step 6: Memory Wipe & CDI Instruction File Generation
-
-The NVIDIA driver daemon on `worker-3` does two critical jobs:
-
-1. **Security Memory Wipe:** It completely flushes and resets the physical VRAM and CUDA context of `gpu-0`. This guarantees that no leftover data, weights, or code from prior workloads can ever leak to the new user.
-2. **Generates the CDI JSON File:** It writes the **Container Device Interface (CDI)** instruction file directly to the host disk at `/var/run/cdi/nvidia.com-gpu.json`:
-
-```json
-{
-  "cdiVersion": "0.5.0",
-  "kind": "nvidia.com/gpu",
-  "devices": [
-    {
-      "name": "gpu-0",
-      "containerEdits": {
-        "deviceNodes": [
-          {"path": "/dev/nvidia0", "hostPath": "/dev/nvidia0"},
-          {"path": "/dev/nvidiactl", "hostPath": "/dev/nvidiactl"},
-          {"path": "/dev/nvidia-uvm", "hostPath": "/dev/nvidia-uvm"},
-          {"path": "/dev/nvidia-uvm-tools", "hostPath": "/dev/nvidia-uvm-tools"}
-        ],
-        "mounts": [
-          {
-            "hostPath": "/usr/lib/x86_64-linux-gnu/libcuda.so.1",
-            "containerPath": "/usr/lib/x86_64-linux-gnu/libcuda.so.1"
-          }
-        ]
-      }
-    }
-  ]
-}
-```
-
-*(This JSON file is the concrete instruction sheet telling the container runtime exactly which files to give the container).*
-
----
-
-### Phase 3: Container Device Attachment & Process Launch (`containerd`)
-
-#### Step 7: Kubelet Calls Container Runtime
-
-- `kubelet` tells **`containerd`** to create the container and passes the CDI device identifier: `nvidia.com/gpu=gpu-0`.
-
-#### Step 8: `containerd` Reads the CDI Instructions
-
-- `containerd` reads `/var/run/cdi/nvidia.com-gpu.json` and prepares to unlock two Linux kernel security gates.
-
-#### Step 9: Gate 1 — Device Node Injection (Private `/dev`)
-
-- By default, a Linux container has an empty `/dev` directory with zero GPU devices.
-- `containerd` injects **ONLY** the files needed for `gpu-0`:
-  - `/dev/nvidia0`: The direct data pipeline to physical GPU 0.
-  - `/dev/nvidiactl`: The master control switch for hardware initialization and telemetry.
-  - `/dev/nvidia-uvm`: Unified Virtual Memory (direct CPU ↔ GPU memory sharing).
-  - `/dev/nvidia-uvm-tools`: Profiling interface for PyTorch/CUDA profilers.
-  - `libcuda.so.1`: The host CUDA driver library (mounted read-only).
-- **Strict Isolation:** If the host machine has 8 physical GPUs (`gpu-0` to `gpu-7`), the other 7 cards (`/dev/nvidia1` through `/dev/nvidia7`) are **not injected**. They simply do not exist inside your container.
-
-#### Step 10: Gate 2 — Linux Kernel Security Filter (Cgroups v2)
-
-- Even if a malicious user inside the container attempts to access other GPUs by guessing device numbers, the Linux kernel **Cgroups v2 device controller** strictly blocks it.
-- `containerd` configures the kernel rule: Allow `read / write / mknod` **ONLY for device `gpu-0`**. Any call to other device IDs is rejected by the Linux kernel.
-
-#### Step 11: Mount Storage & Start the Container
-
-- `containerd` mounts the storage volume at `/data/workspace` (either the Ceph PVC if requested, or the temporary `emptyDir` scratch disk).
-- It executes the container entrypoint process:
-
-```bash
-jupyter lab --ip 0.0.0.0 --port 8888
-```
-
-#### Step 12: Pod Transitions to `Running`
-
-- The container is now healthy and active.
-- Kubernetes updates the Pod status from **`Pending` → `Running`**.
-
----
-
-## Flow 2 Diagram (RFC Style)
-
-```mermaid
-flowchart LR
-    subgraph CP [Cluster Control Plane]
-        rc[("ResourceClaim<br/>(RTX 5090 >= 31Gi)")]:::store
-        rs[("ResourceSlice<br/>(Node GPU Catalog)")]:::store
-        sched["kube-scheduler<br/>(DRA Plugin)"]:::cp
-    end
-
-    subgraph DP [GPU Worker Node — worker-3]
-        klet["kubelet Agent"]:::dp
-        dra["NVIDIA DRA Driver<br/>DaemonSet (UNIX socket)"]:::star
-        cdi[("CDI JSON Spec<br/>/var/run/cdi/...")]:::store
-        ctrd["containerd Runtime"]:::dp
-        dev["Gate 1: Isolated /dev<br/>/dev/nvidia0, uvm, ctl"]:::dp
-        cg["Gate 2: Cgroups v2<br/>Allow: gpu-0 ONLY"]:::dp
-        app["AIRuntime Pod<br/>JupyterLab :8888 (Running)"]:::dp
-    end
-
-    rc --->|"1 read claim"| sched
-    rs -..->|"2 evaluate CEL catalog"| sched
-    sched --->|"3 lock gpu-0 & bind Pod"| klet
-    klet --->|"4 NodePrepareResources"| dra
-    dra --->|"5 wipe VRAM & generate spec"| cdi
-    klet --->|"6 create container"| ctrd
-    cdi -..->|"7 read device directives"| ctrd
-    ctrd --->|"8 inject /dev/nvidia0"| dev
-    ctrd --->|"9 set kernel cgroup filter"| cg
-    dev ---> app
-    cg ---> app
-
-    classDef cp fill:#e7e6fb,stroke:#6b6be0,color:#20233a
-    classDef dp fill:#cdeee7,stroke:#12a594,color:#10302b
-    classDef star fill:#ffe6a7,stroke:#d99a1c,stroke-width:2px,color:#3a2c07
-    classDef store fill:#e6e9ef,stroke:#5b6472,color:#20233a
-```

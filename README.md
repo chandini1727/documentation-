@@ -122,7 +122,6 @@ Inside the operator pod, two components handle the work:
 4. **Handoff to the Worker Node:**  
    The Master Node dispatches the assignment to `worker-3`, and that worker node takes over to prepare the hardware and launch the GPU Pod (Step 4).
 
-
 ```mermaid
 flowchart LR
     cl["client<br/>Console UI / Neev CLI"]:::store
@@ -135,17 +134,10 @@ flowchart LR
     end
 
     subgraph DP [Data Plane - Regional Workload Cluster]
-        k8s[("K8s API Server<br/>Stores: CR, Claims, Pods, Slices")]:::store
-        
-        subgraph OP [airuntime-operator]
-            actrl["airuntime-controller<br/>(Watcher)"]:::dp
-            arec["AIRuntimeReconciler<br/>(Worker)"]:::dp
-        end
-
+        k8s[("K8s API Server<br/>etcd | regional endpoint")]:::store
+        aop["airuntime-operator<br/>AIRuntime Controller"]:::dp
         pvc[("Ceph Storage PVC<br/>(via storage-service)")]:::store
         rc[("ResourceClaim<br/>DRA CEL: RTX 5090 >= 31Gi")]:::store
-        rs[("ResourceSlice<br/>(Worker-3 GPU Catalog)")]:::store
-        sched["kube-scheduler<br/>(DRA Plugin)"]:::star
         pod["AIRuntime Pod<br/>State: Pending (awaiting GPU bind)"]:::dp
     end
 
@@ -157,33 +149,19 @@ flowchart LR
     inv -..->|"6 5-min hold confirmed"| asvc
     asvc --->|"7 insert row (provisioning)"| db
     asvc --->|"8 dispatch AIRuntime CR"| k8s
-
-    %% Operator Watcher & Worker
-    k8s --->|"9 watch event"| actrl
-    actrl --->|"10 trigger reconcile"| arec
-    arec --->|"11 verify storage ready"| pvc
-
-    %% EXACT STEP: Reconciler posts generated resources to K8s API Server
-    arec --->|"12 generate & POST ResourceClaim"| k8s
-    k8s -..->|"persists claim"| rc
-
-    arec --->|"13 generate & POST Pod (nodeName='')"| k8s
-    k8s -..->|"persists pending pod"| pod
-
+    k8s --->|"9 watch event"| aop
+    aop --->|"10 verify storage ready"| pvc
+    aop --->|"11 create GPU claim"| rc
+    aop --->|"12 create Pod (Pending)"| pod
     pvc -..->|"storage attached"| pod
     rc -..->|"claim attached"| pod
-
-    %% Scheduler reads from API Server & binds
-    rc -.->|"14 reads claim"| sched
-    rs -.->|"matches GPU"| sched
-    sched --->|"15 write to API Server: bind nodeName='worker-3'"| k8s
-    k8s -.->|"updates pod"| pod
 
     classDef cp fill:#e7e6fb,stroke:#6b6be0,color:#20233a
     classDef dp fill:#cdeee7,stroke:#12a594,color:#10302b
     classDef star fill:#ffe6a7,stroke:#d99a1c,stroke-width:2px,color:#3a2c07
     classDef store fill:#e6e9ef,stroke:#5b6472,color:#20233a
 ```
+
 ---
 
 ### Step 4: Node Hardware Preparation (`kubelet` & DRA Driver DaemonSet)
